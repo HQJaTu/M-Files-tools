@@ -1,3 +1,11 @@
+# Supplemental files
+client-config.toml
+data/
+unnecessary/
+
+# Editors
+.idea
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
