@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mfiles-tools"
+version = "0.0.1"
+description = "Collection of M-Files tools"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Jari Turkia", email = "jatu@hqcodeshop.fi" }
+]
+dependencies = [
+    "certifi==2025.4.26",
+    "charset-normalizer==3.4.2",
+    "ConfigArgParse==1.7.1",
+    "idna==3.10",
+    "requests==2.33.0",
+    "urllib3==2.6.3",
+    "toml==0.10.2",
+    "truststore==0.10.4",
+    #mfiles==0.5.3",
+    "mfiles @ file:../python-mfiles",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.2",
+    "black>=26.3.1",
+    "flake8>=7.3.0",
+]
+
+[tool.setuptools]
+py-modules = ["connection-test", "ebook-uploader"]

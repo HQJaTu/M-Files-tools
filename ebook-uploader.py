@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+
+# vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 filetype=python
+
+import hashlib
+import logging
+from http import HTTPStatus
+
+import configargparse
+import mfiles
+import truststore
+from tika import parser
+
+log = logging.getLogger(__name__)
+
+
+def _setup_logger(options: configargparse.Namespace) -> None:
+    log_level: int = logging.getLevelName(options.log_level)
+    if not log_level:
+        raise ValueError("Unkown logging level '{}'!".format(options.log_level))
+
+    logging.basicConfig(
+        format="%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s]  [%(name)s] %(message)s",
+        level=log_level
+    )
+    if log_level <= logging.DEBUG:
+        # This guy is noisy! Use a muffler.
+        urllib3_log = logging.getLogger('urllib3')
+        urllib3_log.setLevel(logging.INFO)
+        keyring_log = logging.getLogger('keyring')
+        keyring_log.setLevel(logging.INFO)
+        win32ctypes_log = logging.getLogger('win32ctypes')
+        win32ctypes_log.setLevel(logging.INFO)
+
+
+def calculate_sha1(file_path: str) -> str:
+    hash_algo = hashlib.sha1()
+
+    with open(file_path, "rb") as f:
+        while chunk := f.read(65536):
+            hash_algo.update(chunk)
+
+    return hash_algo.hexdigest()
+
+
+def parse_file(filename: str, tika_server_url: str) -> dict:
+    log.info("Parsing file {}".format(filename))
+    sha1 = calculate_sha1(filename)
+    parsed = parser.from_file(
+        filename,
+        serverEndpoint=tika_server_url,
+        xmlContent=True,
+        requestOptions={
+            "verify": True,
+        }
+    )
+    if not parsed or 'status' not in parsed:
+        raise ValueError("Internal error. Error parsing file {}".format(filename))
+    if parsed['status'] != HTTPStatus.OK:
+        raise ValueError("Error parsing file {}. HTTP/{}".format(filename, parsed['status']))
+    content_len = len(parsed['content'])
+    log.info("Parsed file {} (SHA-1: {}). Got {} bytes of content".format(filename, sha1, content_len))
+
+    """
+    Metadata example:
+    {
+        "Content-Length": "2027797",
+        "Content-Type": "application/pdf",
+        "dc:format": "application/pdf; version=1.4",
+        "dc:language": "en-US",
+        "dcterms:created": "2022-08-19T16:52:28Z",
+        "dcterms:modified": "2022-08-19T16:52:34Z",
+        "xmp:CreatorTool": "Adobe InDesign 17.3 (Windows)",
+        "xmp:CreateDate": "2022-08-19T16:52:28Z",
+        "xmp:ModifyDate": "2022-08-19T16:52:34Z",
+        "xmp:MetadataDate": "2022-08-19T16:52:34Z",
+        "xmp:pdf:Producer": "Adobe PDF Library 16.0.7",
+        "xmpMM:DerivedFrom:DocumentID": "xmp.did:1270208c-fccc-5b4b-bd15-39be7c629c17",
+        "xmpMM:DocumentID": "xmp.id:7b75c61b-1aeb-8c4b-924b-356cd5eb0f44",
+        "xmpMM:DerivedFrom:InstanceID": "xmp.iid:a70f575c-8b93-d04d-a27e-d0174ce861c9",
+        "xmpMM:InstanceID": "uuid:3546a22d-683f-4dbd-a045-9e23132c33b3",
+        "xmpTPg:NPages": "56",
+        "resourceName": "b'8-Data-Modeling-Patterns-in-Redis.pdf'",
+        "access_permission:fill_in_form": "true",
+        "access_permission:can_print_faithful": "true",
+        "access_permission:extract_for_accessibility": "true",
+        "access_permission:modify_annotations": "true",
+        "access_permission:extract_content": "true",
+        "access_permission:can_print": "true",
+        "access_permission:assemble_document": "true",
+        "access_permission:can_modify": "true",
+        "pdf:PDFVersion": "1.4",
+        "pdf:hasXFA": "false",
+        "pdf:num3DAnnotations": "0",
+        "pdf:docinfo:creator_tool": "Adobe InDesign 17.3 (Windows)",
+        "pdf:hasCollection": "false",
+        "pdf:encrypted": "false",
+        "pdf:containsNonEmbeddedFont": "false",
+        "pdf:hasMarkedContent": "true",
+        "pdf:ocrPageCount": "0",
+        "pdf:annotationTypes": "null",
+        "pdf:docinfo:producer": "Adobe PDF Library 16.0.7",
+        "pdf:annotationSubtypes": "Link",
+        "pdf:containsDamagedFont": "false",
+        "pdf:unmappedUnicodeCharsPerPage": [
+            "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
+            "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0",
+            "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"
+        ],
+        "pdf:overallPercentageUnmappedUnicodeChars": "0.0",
+        "pdf:docinfo:modified": "2022-08-19T16:52:34Z",
+        "pdf:producer": "Adobe PDF Library 16.0.7",
+        "pdf:totalUnmappedUnicodeChars": "0",
+        "pdf:hasXMP": "true",
+        "pdf:charsPerPage": [
+            "151", "1833", "2151", "1660", "1560", "637", "986", "1212", "786", "796", "485", "715", "1651",
+            "1100", "1537", "640", "282", "759", "1648", "742", "1614", "510", "805", "1444", "1506", "1294",
+            "651", "689", "367", "888", "1601", "566", "560", "1098", "999", "932", "2024", "1555", "620", "1173", "1031",
+            "1224", "524", "1505", "973", "889", "673", "1857", "1102", "1079", "1533", "1284", "254", "1975", "1902","736"
+        ],
+        "pdf:docinfo:trapped": "False",
+        "pdf:docinfo:created": "2022-08-19T16:52:28Z",
+        "X-TIKA:parse_time_millis": "535",
+        "X-TIKA:Parsed-By-Full-Set": [
+            "org.apache.tika.parser.DefaultParser",
+            "org.apache.tika.parser.pdf.PDFParser"
+        ],
+        "X-TIKA:content_handler": "ToTextContentHandler",
+        "X-TIKA:Parsed-By": [
+            "org.apache.tika.parser.DefaultParser",
+            "org.apache.tika.parser.pdf.PDFParser"
+        ],
+        "X-TIKA:embedded_depth": "0",
+    }
+    """
+
+    content_filename = f"{sha1}.xhtml"
+    with open(content_filename, "w", encoding="utf-8") as f:
+        f.write(parsed['content'])
+    log.info("Wrote content into {}".format(content_filename))
+
+
+def upload(server_address: str, user: str, password: str, vault: str) -> None:
+    # API docs:
+    # https://developer.m-files.com/APIs/REST-API/
+    # Community:
+    # https://community.m-files.com/forums-1552881334/f/m-files-api
+    my_client = mfiles.MFilesClient(server=server_address,
+                                    user=user,
+                                    password=password,
+                                    vault=vault)
+
+    print(my_client)
+    # log.
+
+
+def main():
+    parser = configargparse.ArgParser(
+        description='M-Files Uploader',
+        config_file_parser_class=configargparse.TomlConfigParser(['m-files.tool']),
+    )
+    parser.add_argument('ebook',
+                        metavar='EBOOK-FILENAME',
+                        help='eBook filename to parse and upload')
+    parser.add_argument('--rest-api-url',
+                        required=True,
+                        help="M-Files Vault REST API URL endpoint")
+    parser.add_argument('--username',
+                        required=True,
+                        help="M-Files Vault username")
+    parser.add_argument('--password',
+                        required=True,
+                        help="M-Files Vault password")
+    parser.add_argument('--vault',
+                        help="M-Files Vault GUID. If none given, will default to first vault user has access to.")
+    parser.add_argument('--tika-server-url',
+                        required=True,
+                        help="Tika server URL endpoint")
+    parser.add_argument('--log-level',
+                        default='WARNING',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        env_var='LOG_LEVEL',
+                        help="Python logger log level. Default: WARNING")
+    parser.add_argument('-c', '--config',
+                        is_config_file=True,
+                        help='Config file path')
+    args = parser.parse_args()
+    _setup_logger(args)
+    truststore.inject_into_ssl()
+
+    parse_file(args.ebook, args.tika_server_url)
+    upload(args.rest_api_url, args.username, args.password, args.vault)
+
+
+if __name__ == '__main__':
+    main()
