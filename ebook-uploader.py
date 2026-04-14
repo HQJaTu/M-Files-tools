@@ -4,12 +4,16 @@
 
 import hashlib
 import logging
+import os
+import re
 from http import HTTPStatus
-
+from typing import Optional
 import configargparse
 import mfiles
 import truststore
+from lxml import etree
 from tika import parser
+import pickle
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +47,7 @@ def calculate_sha1(file_path: str) -> str:
     return hash_algo.hexdigest()
 
 
-def parse_file(filename: str, tika_server_url: str) -> dict:
+def parse_file(filename: str, tika_server_url: str, storage_directory: str) -> dict:
     log.info("Parsing file {}".format(filename))
     sha1 = calculate_sha1(filename)
     parsed = parser.from_file(
@@ -134,10 +138,48 @@ def parse_file(filename: str, tika_server_url: str) -> dict:
     }
     """
 
-    content_filename = f"{sha1}.xhtml"
-    with open(content_filename, "w", encoding="utf-8") as f:
-        f.write(parsed['content'])
-    log.info("Wrote content into {}".format(content_filename))
+    xhtml = extract_primary_document(parsed['content'])
+    if not xhtml:
+        return parsed
+
+    # Looking good!
+    del parsed['content']
+    parsed['xhtml'] = xhtml
+
+    if False:
+        content_filename = os.path.join(storage_directory, f"{sha1}.bin")
+        with open(content_filename, "w", encoding="utf-8") as f:
+            f.write(xhtml)
+        log.info("Wrote content into {}".format(content_filename))
+
+    parsed_filename = os.path.join(storage_directory, f"{sha1}.bin")
+    with open(parsed_filename, 'wb') as handle:
+        pickle.dump(parsed, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    return parsed
+
+
+def extract_primary_document(xhtml_string: str) -> Optional[str]:
+    """
+    Helper function to extract primary document from xhtml string
+    :param xhtml_string: XHTML string as returned by Apache Tika
+    :return: XHTML string that is actually valid XML
+    """
+
+    # Split by the XHTML namespace declaration or the opening <html> tag
+    # This keeps the first occurrence and discards everything after the second <html> starts
+    parts = re.split(r'(?=<html)', xhtml_string, flags=re.IGNORECASE)
+
+    parser = etree.XMLParser(recover=True, remove_comments=True)
+    for part in parts:
+        if not part:
+            continue
+        root = etree.fromstring(part.encode('utf-8'), parser=parser)
+        is_xhtml = 'http://www.w3.org/1999/xhtml' in root.nsmap.values()
+        if is_xhtml:
+            return part
+
+    return None
 
 
 def upload(server_address: str, user: str, password: str, vault: str) -> None:
@@ -157,7 +199,9 @@ def upload(server_address: str, user: str, password: str, vault: str) -> None:
 def main():
     parser = configargparse.ArgParser(
         description='M-Files Uploader',
-        config_file_parser_class=configargparse.TomlConfigParser(['m-files.tool']),
+        config_file_parser_class=configargparse.TomlConfigParser(
+            ['m-files.tool.ebook-uploader', 'm-files.tool.common']
+        ),
     )
     parser.add_argument('ebook',
                         metavar='EBOOK-FILENAME',
@@ -176,6 +220,9 @@ def main():
     parser.add_argument('--tika-server-url',
                         required=True,
                         help="Tika server URL endpoint")
+    parser.add_argument('--storage-directory',
+                        required=True,
+                        help="Directory to store uploaded file metadata")
     parser.add_argument('--log-level',
                         default='WARNING',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
@@ -188,7 +235,7 @@ def main():
     _setup_logger(args)
     truststore.inject_into_ssl()
 
-    parse_file(args.ebook, args.tika_server_url)
+    parse_file(args.ebook, args.tika_server_url, args.storage_directory)
     upload(args.rest_api_url, args.username, args.password, args.vault)
 
 

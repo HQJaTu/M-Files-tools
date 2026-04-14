@@ -208,7 +208,9 @@ def ping(server_address: str, user: str, password: str, vault: str) -> None:
 def main():
     parser = configargparse.ArgParser(
         description='M-Files REST API Connection Test',
-        config_file_parser_class=configargparse.TomlConfigParser(['m-files.tool']),
+        config_file_parser_class=configargparse.TomlConfigParser(
+            ['m-files.tool.common', 'm-files.tool.connection-test']
+        ),
     )
     parser.add_argument('--rest-api-url',
                         required=True,

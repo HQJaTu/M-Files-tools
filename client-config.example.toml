@@ -1,7 +1,13 @@
-[m-files.tool]
-rest-api-url = "https://<youer-vault-DNS-prefix>.cloudvault.m-files.com/REST/"
-username = "<your-admin-username"
+[m-files.tool.common]
+rest-api-url = "https://<your-vault-DNS-prefix>.cloudvault.m-files.com/REST/"
+username = "<your-admin-username>"
 password = "<your-admin-password>"
 vault = "{<your-optional-vault-GUID-if-not-given-first-vault-GUID-used>}"
 log-level = "INFO"
+
+[m-files.tool.connection-test]
+# Nothing
+
+[m-files.tool.ebook-uploader]
+storage-directory = "<a-directory>"
 tika-server-url = "https://<your-tika-server-url>"
