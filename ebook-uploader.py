@@ -5,15 +5,17 @@
 import hashlib
 import logging
 import os
+import pathlib
+import pickle
 import re
 from http import HTTPStatus
 from typing import Optional
+
 import configargparse
 import mfiles
 import truststore
 from lxml import etree
 from tika import parser
-import pickle
 
 log = logging.getLogger(__name__)
 
@@ -47,23 +49,117 @@ def calculate_sha1(file_path: str) -> str:
     return hash_algo.hexdigest()
 
 
+def is_pdf_by_sig(file_path: str) -> bool:
+    """
+    Helper:
+    Determine if a given filename is a PDF file or not
+    :param file_path: File to check for
+    :return: True if signature suggests a PDF-file
+    """
+    try:
+        with open(file_path, 'rb') as f:
+            # Read the first 5 bytes
+            header = f.read(5)
+            return header == b'%PDF-'
+    except IOError:
+        pass
+
+    return False
+
+
+def parse_files(filename_or_dir: str, tika_server_url: str, storage_directory: str) -> int:
+    """
+    Worker: Wrap
+    :param filename_or_dir:
+    :param tika_server_url:
+    :param storage_directory:
+    :return:
+    """
+    file_count = 0
+    ebook_count = 0
+    if os.path.isdir(filename_or_dir):
+        for root, dirs, files in os.walk(filename_or_dir):
+            log.info("Scanning directory: {}".format(root))
+
+            # Process the files
+            for file in files:
+                file_count += 1
+                full_path = os.path.join(root, file)
+                if is_pdf_by_sig(full_path):
+                    # log.info("Parsing PDF file: {}".format(full_path))
+                    result = parse_file(full_path, tika_server_url, storage_directory)
+                    if 'xhtml' in result:
+                        ebook_count += 1
+    elif os.path.isfile(filename_or_dir):
+        log.info("Scanning file: {}".format(filename_or_dir))
+        file_count = 1
+        result = parse_file(filename_or_dir, tika_server_url, storage_directory)
+        if 'xhtml' in result:
+            ebook_count += 1
+
+    log.info("Did a total of {} files, {} e-books".format(file_count, ebook_count))
+
+    return file_count
+
+
+def should_rebuild(source_path: str, cache_path: str) -> bool:
+    """
+    Helper: Determine if a file needs to be re-Tika'd
+    :param source_path: PDF-file
+    :param cache_path: Cache file
+    :return: True if cache file needs to be done
+    """
+    source = pathlib.Path(source_path)
+    cache = pathlib.Path(cache_path)
+
+    # 1. Check if cache exists
+    if not cache.exists():
+        return True
+
+    # 2. Compare modification timestamps
+    # .stat().st_mtime returns a float representing seconds since epoch
+    return source.stat().st_mtime > cache.stat().st_mtime
+
+
 def parse_file(filename: str, tika_server_url: str, storage_directory: str) -> dict:
+    """
+    Worker:
+    :param filename:
+    :param tika_server_url:
+    :param storage_directory:
+    :return:
+    """
     log.info("Parsing file {}".format(filename))
     sha1 = calculate_sha1(filename)
-    parsed = parser.from_file(
-        filename,
-        serverEndpoint=tika_server_url,
-        xmlContent=True,
-        requestOptions={
-            "verify": True,
-        }
-    )
+    parsed_filename = os.path.join(storage_directory, f"{sha1}.bin")
+    if not should_rebuild(filename, parsed_filename):
+        # Return something we processed earlier
+        log.debug("Returning file {} data from cache: {}".format(filename, parsed_filename))
+        with open(parsed_filename, 'rb') as f:
+            data = pickle.load(f)
+            return data
+
+    # Go Tika the file
+    log.debug("Calling Tika to parse the file: {}".format(filename))
+    try:
+        parsed = parser.from_file(
+            filename,
+            serverEndpoint=tika_server_url,
+            xmlContent=True,
+            requestOptions={
+                "verify": True,
+            }
+        )
+    except Exception as e:
+        log.error("Error parsing file: {}".format(e))
+        return {}
+
     if not parsed or 'status' not in parsed:
         raise ValueError("Internal error. Error parsing file {}".format(filename))
     if parsed['status'] != HTTPStatus.OK:
         raise ValueError("Error parsing file {}. HTTP/{}".format(filename, parsed['status']))
     content_len = len(parsed['content'])
-    log.info("Parsed file {} (SHA-1: {}). Got {} bytes of content".format(filename, sha1, content_len))
+    log.debug("Parsed file {} (SHA-1: {}). Got {} bytes of content".format(filename, sha1, content_len))
 
     """
     Metadata example:
@@ -139,11 +235,12 @@ def parse_file(filename: str, tika_server_url: str, storage_directory: str) -> d
     """
 
     xhtml = extract_primary_document(parsed['content'])
+    del parsed['content']
     if not xhtml:
+        log.warning("Tika failed to extract XHTML content from {}".format(parsed_filename))
         return parsed
 
     # Looking good!
-    del parsed['content']
     parsed['xhtml'] = xhtml
 
     if False:
@@ -152,7 +249,6 @@ def parse_file(filename: str, tika_server_url: str, storage_directory: str) -> d
             f.write(xhtml)
         log.info("Wrote content into {}".format(content_filename))
 
-    parsed_filename = os.path.join(storage_directory, f"{sha1}.bin")
     with open(parsed_filename, 'wb') as handle:
         pickle.dump(parsed, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -235,7 +331,7 @@ def main():
     _setup_logger(args)
     truststore.inject_into_ssl()
 
-    parse_file(args.ebook, args.tika_server_url, args.storage_directory)
+    parse_files(args.ebook, args.tika_server_url, args.storage_directory)
     upload(args.rest_api_url, args.username, args.password, args.vault)
 
 

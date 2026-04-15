@@ -3,6 +3,35 @@ https://product.m-files.com/downloads/
 
 # Apache Tika
 
+## Podman
+Run in background:
+```text
+podman run -p 9998:9998 --detach apache/tika:latest
+```
+
+## On Memory
+Large files will cause Tika to crash with a 'java.lang.OutOfMemoryError: Java heap space'
+
+An example of a large PDF file is 400 MiB file size with 296 pages in it.
+
+```text
+podman run \
+  -p 9998:9998 \
+  --detach \
+  -e TIKA_CHILD_OPTS="-Xmx4g" \
+  --memory="5g" \
+  apache/tika:latest
+```
+
+### Heap size:
+Running something like `java -XX:+PrintFlagsFinal -version | grep MaxHeapSize` will state:
+```text
+   size_t MaxHeapSize                              = 501219328
+   size_t SoftMaxHeapSize                          = 501219328
+```
+
+# Tunneling to Tika with Ngrok
+
 ## As front command
 Command:
 ```text
@@ -49,3 +78,10 @@ curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[].public_url'
 ```
 
 Will return something like: https://6ab5-2a01-4f8-c0c-9cf9-00-1.ngrok-free.app
+
+# Security considerations
+
+## Windows
+
+As the content of an eBook may be considered as "malicious" by real-time virus scanner,
+adding the venv `python.exe` as a process exclusion may be needed.
