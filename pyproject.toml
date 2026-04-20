@@ -21,6 +21,7 @@ dependencies = [
     "toml==0.10.2",
     "truststore==0.10.4",
     "lxml==6.0.4",
+    "openai==2.32.0",
     #mfiles==0.5.3",
     "mfiles @ file:../python-mfiles",
 ]

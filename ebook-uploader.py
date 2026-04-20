@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-
+import ast
 # vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 filetype=python
 
 import hashlib
+import json
 import logging
 import os
 import pathlib
@@ -14,7 +15,10 @@ from typing import Optional
 import configargparse
 import mfiles
 import truststore
-from lxml import etree
+from lxml import etree, html as etree_html
+from openai import AzureOpenAI, Stream
+from openai.types.chat import ChatCompletion, ChatCompletionMessageParam, ChatCompletionChunk, \
+    ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam
 from tika import parser
 
 log = logging.getLogger(__name__)
@@ -37,6 +41,13 @@ def _setup_logger(options: configargparse.Namespace) -> None:
         keyring_log.setLevel(logging.INFO)
         win32ctypes_log = logging.getLogger('win32ctypes')
         win32ctypes_log.setLevel(logging.INFO)
+        openai_log = logging.getLogger('openai')
+        openai_log.setLevel(logging.INFO)
+        httpcore_log = logging.getLogger('httpcore')
+        httpcore_log.setLevel(logging.INFO)
+    if log_level <= logging.INFO:
+        httpx_log = logging.getLogger('httpx')
+        httpx_log.setLevel(logging.WARNING)
 
 
 def calculate_sha1(file_path: str) -> str:
@@ -67,41 +78,6 @@ def is_pdf_by_sig(file_path: str) -> bool:
     return False
 
 
-def parse_files(filename_or_dir: str, tika_server_url: str, storage_directory: str) -> int:
-    """
-    Worker: Wrap
-    :param filename_or_dir:
-    :param tika_server_url:
-    :param storage_directory:
-    :return:
-    """
-    file_count = 0
-    ebook_count = 0
-    if os.path.isdir(filename_or_dir):
-        for root, dirs, files in os.walk(filename_or_dir):
-            log.info("Scanning directory: {}".format(root))
-
-            # Process the files
-            for file in files:
-                file_count += 1
-                full_path = os.path.join(root, file)
-                if is_pdf_by_sig(full_path):
-                    # log.info("Parsing PDF file: {}".format(full_path))
-                    result = parse_file(full_path, tika_server_url, storage_directory)
-                    if 'xhtml' in result:
-                        ebook_count += 1
-    elif os.path.isfile(filename_or_dir):
-        log.info("Scanning file: {}".format(filename_or_dir))
-        file_count = 1
-        result = parse_file(filename_or_dir, tika_server_url, storage_directory)
-        if 'xhtml' in result:
-            ebook_count += 1
-
-    log.info("Did a total of {} files, {} e-books".format(file_count, ebook_count))
-
-    return file_count
-
-
 def should_rebuild(source_path: str, cache_path: str) -> bool:
     """
     Helper: Determine if a file needs to be re-Tika'd
@@ -121,23 +97,90 @@ def should_rebuild(source_path: str, cache_path: str) -> bool:
     return source.stat().st_mtime > cache.stat().st_mtime
 
 
-def parse_file(filename: str, tika_server_url: str, storage_directory: str) -> dict:
+def parse_files(filename_or_dir: str, tika_server_url: str, storage_directory: str,
+                gpt_client: AzureOpenAI, model_deployment_to_use: str) -> int:
     """
-    Worker:
-    :param filename:
-    :param tika_server_url:
-    :param storage_directory:
+    Worker: Wrap
+    :param filename_or_dir: File to parse or diretory to recurse for file
+    :param tika_server_url: Apache Tika URL to use for parsing
+    :param storage_directory: Local directory to store parsed data into
+    :param gpt_client: ChatGPT client object
+    :param model_deployment_to_use: ChatGPT model / Microsoft Foundry Deployment to use
     :return:
     """
+    file_count = 0
+    ebook_count = 0
+    if os.path.isdir(filename_or_dir):
+        for root, dirs, files in os.walk(filename_or_dir):
+            log.info("Scanning directory: {}".format(root))
+
+            # Process the files
+            for file in files:
+                file_count += 1
+                full_path = os.path.join(root, file)
+                if not is_pdf_by_sig(full_path):
+                    continue
+
+                if _process_single_ebook(full_path,
+                                         tika_server_url, storage_directory,
+                                         gpt_client, model_deployment_to_use):
+                    ebook_count += 1
+
+    elif os.path.isfile(filename_or_dir):
+        log.info("Scanning file: {}".format(filename_or_dir))
+        file_count = 1
+        if not is_pdf_by_sig(filename_or_dir):
+            raise ValueError(f"{filename_or_dir} is not a PDF-file!")
+
+        if _process_single_ebook(filename_or_dir,
+                                 tika_server_url, storage_directory,
+                                 gpt_client, model_deployment_to_use):
+            ebook_count += 1
+
+    log.info("Did a total of {} files, {} e-books".format(file_count, ebook_count))
+
+    return file_count
+
+
+def _process_single_ebook(filename: str, tika_server_url: str, storage_directory: str,
+                          gpt_client: AzureOpenAI, model_deployment_to_use: str) -> bool:
+    """
+    Worker: Process a single eBook
+    :param filename: PDF eBook to parse with Apache Tika
+    :param tika_server_url: Apache Tika URL to use for parsing
+    :param storage_directory: Local directory to store parsed data into
+    :param gpt_client:
+    :param model_deployment_to_use:
+    :return:
+    """
+    # log.info("Parsing PDF file: {}".format(full_path))
+    sha1, parse_result = _load_ebook(filename, storage_directory)
+    if not parse_result:
+        parse_result = parse_file(filename, tika_server_url, storage_directory)
+        if 'xhtml' not in parse_result:
+            return False
+
+        parse_result['Content-Hash-SHA1'] = sha1
+        _save_ebook(parse_result, storage_directory)
+
+    if 'ai-summary' in parse_result:
+        return True
+
+    enriched_parse_result = generate_ai_summary(parse_result, gpt_client, model_deployment_to_use)
+    _save_ebook(enriched_parse_result, storage_directory)
+
+    return True
+
+
+def parse_file(filename: str, tika_server_url: str, storage_directory: str) -> dict:
+    """
+    Worker
+    :param filename: PDF eBook to parse with Apache Tika
+    :param tika_server_url: Apache Tika URL to use for parsing
+    :param storage_directory: Local directory to store parsed data into
+    :return: Parsed data
+    """
     log.info("Parsing file {}".format(filename))
-    sha1 = calculate_sha1(filename)
-    parsed_filename = os.path.join(storage_directory, f"{sha1}.bin")
-    if not should_rebuild(filename, parsed_filename):
-        # Return something we processed earlier
-        log.debug("Returning file {} data from cache: {}".format(filename, parsed_filename))
-        with open(parsed_filename, 'rb') as f:
-            data = pickle.load(f)
-            return data
 
     # Go Tika the file
     log.debug("Calling Tika to parse the file: {}".format(filename))
@@ -159,7 +202,7 @@ def parse_file(filename: str, tika_server_url: str, storage_directory: str) -> d
     if parsed['status'] != HTTPStatus.OK:
         raise ValueError("Error parsing file {}. HTTP/{}".format(filename, parsed['status']))
     content_len = len(parsed['content'])
-    log.debug("Parsed file {} (SHA-1: {}). Got {} bytes of content".format(filename, sha1, content_len))
+    log.debug("Parsed file {}. Got {} bytes of content".format(filename, content_len))
 
     """
     Metadata example:
@@ -237,7 +280,7 @@ def parse_file(filename: str, tika_server_url: str, storage_directory: str) -> d
     xhtml = extract_primary_document(parsed['content'])
     del parsed['content']
     if not xhtml:
-        log.warning("Tika failed to extract XHTML content from {}".format(parsed_filename))
+        log.warning("Tika failed to extract XHTML content from {}".format(filename))
         return parsed
 
     # Looking good!
@@ -249,15 +292,109 @@ def parse_file(filename: str, tika_server_url: str, storage_directory: str) -> d
             f.write(xhtml)
         log.info("Wrote content into {}".format(content_filename))
 
+    return parsed
+
+
+def _load_ebook(filename: str, storage_directory: str) -> tuple[str, dict]:
+    """
+    Worker:
+    :param filename: Filename of PDF eBook
+    :param storage_directory: Local directory to load parsed data from
+    :return: Tika parsed metadata and XHTML content
+    """
+    sha1 = calculate_sha1(filename)
+    parsed_filename = os.path.join(storage_directory, f"{sha1}.bin")
+    if not should_rebuild(filename, parsed_filename):
+        # Return something we processed earlier
+        log.debug("Returning file {} data from cache: {}".format(filename, parsed_filename))
+        with open(parsed_filename, 'rb') as f:
+            data = pickle.load(f)
+            data['Content-Hash-SHA1'] = sha1
+
+            return sha1, data
+
+    return sha1, {}
+
+
+def _save_ebook(parsed: dict, storage_directory: str) -> None:
+    """
+    Helper function for saving parsed ebook to disk
+    :param parsed: Tika parsed metadata and XHTML content
+    :param storage_directory: Local directory to store parsed data into
+    :return:
+    """
+    sha1 = parsed['Content-Hash-SHA1']
+    if not sha1:
+        raise ValueError("Internal error: Parsed dictionary doesn't have eBook SHA-1!")
+    parsed_filename = os.path.join(storage_directory, f"{sha1}.bin")
     with open(parsed_filename, 'wb') as handle:
         pickle.dump(parsed, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-    return parsed
+
+def generate_ai_summary(parsed_ebook: dict,
+                        gpt_client: AzureOpenAI, model_deployment_to_use: str) -> dict:
+    """
+    Worker
+    Go ChatGPT and
+    :param parsed_ebook: Tika parsed metadata and XHTML content
+    :param gpt_client: ChatGPT client to use for AI
+    :param model_deployment_to_use: ChatGPT model (Microsoft Foundry deployment) to use for AI
+    :return: Tika parsed metadata and XHTML content with AI summary
+    """
+
+    # Extract first 25 pages of text
+    root = etree_html.fromstring(parsed_ebook['xhtml'])
+    pages = root.xpath('//div[@class="page"]')
+    first_pages = ""
+    pages_to_read = 25
+    for page in pages:
+        content = page.text_content().strip()
+        first_pages += content + "\n"
+        pages_to_read -= 1
+        if pages_to_read == 0:
+            break
+
+    first_pages = first_pages.strip()
+    if not first_pages:
+        return parsed_ebook
+
+    # Go LLM!
+    # Try to extract the filename for logging purposes. It can be very tricky!
+    filename = parsed_ebook["metadata"]["resourceName"]
+    if isinstance(filename, list):
+        filename = filename[0]
+    try:
+        filename = ast.literal_eval(filename).decode("utf-8")
+    except:
+        pass
+    log.debug("Generating summary for {}".format(filename))
+    result = query_gpt(gpt_client, model_deployment_to_use, first_pages)
+
+    if len(result.choices) == 0 or not result.choices[0].message.content:
+        return parsed_ebook
+
+    """
+    Response example:
+    {
+      "book_title": "The Cathedral and the Bazaar: Musings on Linux and Open Source by an Accidental Revolutionary, Revised Edition",
+      "publisher": "O\'Reilly & Associates, Inc.",
+      "authors": ["Eric S. Raymond", "Bob Young"],
+      "isbn": ["0-596-00108-8", "0-596-00131-2"],
+      "keywords": ["hackerdom", "open source", "Linux", "Unix", "Free Software Foundation", "ARPAnet", "PDP-10", "GNU", "software development", "history of hackers"],
+      "publishing_year": 2001
+    }
+    """
+
+    ai_summary = json.loads(result.choices[0].message.content)
+    enriched_ebook = parsed_ebook.copy()
+    enriched_ebook['ai-summary'] = ai_summary
+
+    return enriched_ebook
 
 
 def extract_primary_document(xhtml_string: str) -> Optional[str]:
     """
-    Helper function to extract primary document from xhtml string
+    Helper function to extract primary document from input string
     :param xhtml_string: XHTML string as returned by Apache Tika
     :return: XHTML string that is actually valid XML
     """
@@ -276,6 +413,76 @@ def extract_primary_document(xhtml_string: str) -> Optional[str]:
             return part
 
     return None
+
+
+def initialize_gpt_client(endpoint: str, subscription_key: str) -> tuple[AzureOpenAI, str]:
+    """
+    Set up a connection to Azure OpenAI client with specified parameters
+    :return: client-object, a handle to LLM
+    """
+
+    # Get connection details.
+    model_deployment = "gpt-5.4-mini"  # Context window: 400k tokens
+    api_version = "2024-12-01-preview"
+
+    # Set up chat client.
+    gpt_client = AzureOpenAI(
+        api_version=api_version,
+        azure_endpoint=endpoint,
+        api_key=subscription_key,
+    )
+
+    return gpt_client, model_deployment
+
+
+def query_gpt(
+        gpt_client: AzureOpenAI, model_deployment_to_use: str, first_pages_of_the_book: str
+) -> ChatCompletion | Stream[ChatCompletionChunk]:
+    """
+    Send a request to LLM
+    :param first_pages_of_the_book: Something to ask from LLM
+    :return: response-object
+    """
+
+    system_content = """
+Role: You are a specialized data extraction assistant. Your task is to analyze the provided text, which consists of the first 20 pages of a book, and extract specific bibliographic metadata and thematic information.
+
+Task: Analyze the input text and extract the following:
+1. Book Title: The full name of the book.
+2. Publisher: The entity responsible for publishing the work.
+3. Author(s): A list of all authors or editors mentioned.
+4. ISBN: Any 10 or 13-digit International Standard Book Numbers found.
+5. Keywords: Identify 5–10 descriptive keywords based strictly on the Table of Contents and introductory headers.
+6. Publishing year
+
+Output Format: You must respond only with a valid JSON object. Do not include conversational filler, markdown code blocks (unless requested), or explanations. Use the following schema:
+{
+  "book_title": "string",
+  "publisher": "string",
+  "authors": ["string"],
+  "isbn": ["string"],
+  "keywords": ["string"],
+  "publishing_year": integer
+}
+
+Constraint: If a specific piece of information (like the ISBN or Publisher) is not found within the provided pages, set the value to null or an empty list [] as appropriate.
+"""
+
+    msgs: list[ChatCompletionMessageParam] = [
+        ChatCompletionSystemMessageParam(content=system_content, role="system"),
+        ChatCompletionUserMessageParam(content=first_pages_of_the_book, role="user")
+    ]
+
+    # Get a response.
+    response = gpt_client.chat.completions.create(
+        messages=msgs,
+        max_completion_tokens=1000,
+        temperature=0.5,  # default: 1.0 to be more adventurous
+        top_p=1.0,  # default: 1.0 to use 100% of the words
+        model=model_deployment_to_use
+    )
+
+    return response
 
 
 def upload(server_address: str, user: str, password: str, vault: str) -> None:
@@ -316,6 +523,12 @@ def main():
     parser.add_argument('--tika-server-url',
                         required=True,
                         help="Tika server URL endpoint")
+    parser.add_argument('--gpt-url',
+                        required=True,
+                        help="OpenAI ChatGPT endpoint URL")
+    parser.add_argument('--gpt-key',
+                        required=True,
+                        help="OpenAI ChatGPT access key")
     parser.add_argument('--storage-directory',
                         required=True,
                         help="Directory to store uploaded file metadata")
@@ -331,7 +544,8 @@ def main():
     _setup_logger(args)
     truststore.inject_into_ssl()
 
-    parse_files(args.ebook, args.tika_server_url, args.storage_directory)
+    gpt_client, gpt_model = initialize_gpt_client(args.gpt_url, args.gpt_key)
+    parse_files(args.ebook, args.tika_server_url, args.storage_directory, gpt_client, gpt_model)
     upload(args.rest_api_url, args.username, args.password, args.vault)
 
 
