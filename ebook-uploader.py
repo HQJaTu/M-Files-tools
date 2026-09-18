@@ -22,8 +22,6 @@ from openai.types.chat import ChatCompletion, ChatCompletionMessageParam, ChatCo
     ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam
 from tika import parser
 
-# vim: autoindent tabstop=4 shiftwidth=4 expandtab softtabstop=4 filetype=python
-
 log = logging.getLogger(__name__)
 
 
