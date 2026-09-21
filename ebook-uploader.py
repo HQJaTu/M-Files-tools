@@ -10,19 +10,92 @@ import os
 import pathlib
 import pickle
 import re
+from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from typing import Optional
+from urllib.parse import quote
 
 import configargparse
 import mfiles
 import truststore
 from lxml import etree, html as etree_html
+from mfiles.errors import MFilesException
 from openai import AzureOpenAI, Stream, BadRequestError
 from openai.types.chat import ChatCompletion, ChatCompletionMessageParam, ChatCompletionChunk, \
     ChatCompletionSystemMessageParam, ChatCompletionUserMessageParam
 from tika import parser
 
 log = logging.getLogger(__name__)
+
+# Built-in M-Files property definitions we store eBook metadata into.
+# See: https://developer.m-files.com/APIs/REST-API/Reference/structure/properties/
+MFILES_PROPERTY_NAME_OR_TITLE = 0
+MFILES_PROPERTY_SINGLE_FILE = 22
+MFILES_PROPERTY_KEYWORDS = 26
+MFILES_PROPERTY_COMMENT = 33
+MFILES_PROPERTY_CLASS = 100
+MFILES_OBJECT_TYPE_DOCUMENT = 0
+
+# https://developer.m-files.com/APIs/REST-API/Reference/enumerations/mfdatatype/
+MFILES_DATATYPE_TEXT = 1
+MFILES_DATATYPE_INTEGER = 2
+MFILES_DATATYPE_BOOLEAN = 8
+MFILES_DATATYPE_LOOKUP = 9
+MFILES_DATATYPE_MULTISELECT_LOOKUP = 10
+MFILES_DATATYPE_MULTILINE_TEXT = 13
+
+# A vault will silently truncate anything longer in a text (not multi-line text) property.
+MFILES_TEXT_PROPERTY_MAX_LENGTH = 100
+
+# Index of which SHA-1 each eBook hashed to, kept in the storage directory next to the
+# parsed data it names. Lets a re-run skip hashing the eBooks it already knows.
+SOURCE_INDEX_FILENAME = "source-index.json"
+
+# Vault property definitions holding the bibliographic data of an eBook, and the data
+# type each one has to be. Resolved by name, as their IDs differ from one vault to the next.
+EBOOK_PROPERTIES = {
+    'isbn': ("ISBN", MFILES_DATATYPE_TEXT),
+    'publishing_year': ("Publishing year", MFILES_DATATYPE_INTEGER),
+    'page_count': ("Page count", MFILES_DATATYPE_INTEGER),
+    'source_sha1': ("Source SHA-1", MFILES_DATATYPE_TEXT),
+}
+
+
+@dataclass(frozen=True)
+class ReferenceTarget:
+    """
+    An object type an eBook refers to, such as 'Author', together with the
+    multi-select lookup property definition doing the referring. A vault creates
+    that property automatically when the object type itself is created.
+    """
+    name: str
+    object_type_id: int
+    object_class_id: int
+    property_def_id: int
+    # Object IDs of the objects resolved so far, keyed by lowercased name. Authors
+    # repeat heavily across a library, so this saves a search per eBook after the first.
+    resolved: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class UploadDestination:
+    """
+    A logged in M-Files vault, resolved object type / class to create eBooks as,
+    the eBook bundles every uploaded eBook gets associated with and the object
+    types an eBook links its bibliographic data to.
+    """
+    client: mfiles.MFilesClient
+    object_type_id: int
+    object_class_id: int
+    bundle: Optional[ReferenceTarget] = None
+    bundle_ids: tuple[int, ...] = field(default_factory=tuple)
+    author: Optional[ReferenceTarget] = None
+    publisher: Optional[ReferenceTarget] = None
+    # Set when the eBook object type is owned by the bundle object type. An owner is a
+    # single mandatory value instead of an optional multi-select reference.
+    owner_property_def_id: Optional[int] = None
+    # Property definition IDs of EBOOK_PROPERTIES this vault has, keyed the same way
+    properties: dict[str, int] = field(default_factory=dict)
 
 
 def _setup_logger(options: configargparse.Namespace) -> None:
@@ -99,9 +172,90 @@ def should_rebuild(source_path: str, cache_path: str) -> bool:
     return source.stat().st_mtime > cache.stat().st_mtime
 
 
+def parsed_filename(sha1: str, storage_directory: str) -> str:
+    """
+    Helper: Build the name of the file the parsed data of an eBook is cached in
+    :param sha1: SHA-1 hash of the PDF eBook
+    :param storage_directory: Local directory the parsed data is stored in
+    :return: Path of the cache file
+    """
+    return os.path.join(storage_directory, "{}.bin".format(sha1))
+
+
+def load_source_index(storage_directory: str) -> dict:
+    """
+    Helper: Read the eBook path to SHA-1 index earlier runs left behind
+    :param storage_directory: Local directory the parsed data is stored in
+    :return: SHA-1 hashes keyed by the absolute path of the PDF they were taken of
+    """
+    index_path = os.path.join(storage_directory, SOURCE_INDEX_FILENAME)
+    if not os.path.exists(index_path):
+        return {}
+
+    try:
+        with open(index_path, 'r', encoding='utf-8') as index_file:
+            return json.load(index_file)
+    except (OSError, ValueError) as e:
+        # A broken index costs time, never correctness: every eBook simply gets hashed again.
+        log.warning("Ignoring unreadable {}: {}".format(index_path, e))
+        return {}
+
+
+def save_source_index(index: dict, storage_directory: str) -> None:
+    """
+    Helper: Store the eBook path to SHA-1 index for the next run to use
+    :param index: SHA-1 hashes keyed by the absolute path of the PDF they were taken of
+    :param storage_directory: Local directory the parsed data is stored in
+    """
+    index_path = os.path.join(storage_directory, SOURCE_INDEX_FILENAME)
+    temporary_path = index_path + ".tmp"
+    try:
+        # Written aside and moved into place, so an interrupted run cannot leave behind
+        # a half-written index in place of a good one.
+        with open(temporary_path, 'w', encoding='utf-8') as index_file:
+            json.dump(index, index_file, indent=1, sort_keys=True)
+        os.replace(temporary_path, index_path)
+        log.debug("Wrote {} eBook hashes into {}".format(len(index), index_path))
+    except OSError as e:
+        log.warning("Could not write {}: {}".format(index_path, e))
+
+
+def sha1_of_ebook(filename: str, storage_directory: str, index: dict) -> str | bool:
+    """
+    Worker: Get the SHA-1 of a PDF eBook, reading the whole of it only when it has to.
+
+    Hashing every eBook on every run means reading the entire library, tens of gigabytes
+    of it, before any cache can even be consulted. An eBook whose parsed metadata is
+    newer than the eBook itself cannot have changed since that metadata was written, so
+    the SHA-1 an earlier run recorded for it still holds.
+
+    :param filename: PDF eBook to identify
+    :param storage_directory: Local directory the parsed data is stored in
+    :param index: SHA-1 hashes of earlier runs, keyed by absolute PDF path. Updated in place.
+    :return: SHA-1 hash of the eBook, or False if the file isn't a PDF at all
+    """
+    absolute_path = os.path.abspath(filename)
+    known_sha1 = index.get(absolute_path)
+    if known_sha1 and not should_rebuild(filename, parsed_filename(known_sha1, storage_directory)):
+        log.debug("Metadata of {} is newer than the eBook, not hashing it again".format(filename))
+        return known_sha1
+
+    sha1 = is_pdf_by_sig(filename)
+    if sha1:
+        index[absolute_path] = str(sha1)
+    elif known_sha1:
+        # It was a PDF the last time and isn't one now. Whatever it has become, the
+        # hash on record is not of it.
+        del index[absolute_path]
+
+    return sha1
+
+
 def parse_files(filename_or_dir: str, tika_server_url: str, storage_directory: str,
                 gpt_client: AzureOpenAI, model_deployment_to_use: str,
-                fast_foward_sha1_hash: Optional[str] = None) -> int:
+                destination: Optional[UploadDestination] = None,
+                fast_foward_sha1_hash: Optional[str] = None,
+                bundle_from_path: int = 0) -> int:
     """
     Worker: Wrap
     :param filename_or_dir: File to parse or diretory to recurse for file
@@ -109,56 +263,225 @@ def parse_files(filename_or_dir: str, tika_server_url: str, storage_directory: s
     :param storage_directory: Local directory to store parsed data into
     :param gpt_client: ChatGPT client object
     :param model_deployment_to_use: ChatGPT model / Microsoft Foundry Deployment to use
+    :param destination: M-Files vault to upload the eBooks into. If none given, nothing is uploaded.
     :param fast_foward_sha1_hash: SHA1 hash to use for fast foward
+    :param bundle_from_path: Directory level naming the eBook bundle. 0 leaves the bundles as given.
     :return: count of files processed
     """
     file_count = 0
     ebook_count = 0
     fast_forwarding_until = fast_foward_sha1_hash
-    if os.path.isdir(filename_or_dir):
-        for root, dirs, files in os.walk(filename_or_dir):
-            log.info("Scanning directory: {}".format(root))
+    source_index = load_source_index(storage_directory)
+    hashes_known = len(source_index)
+    try:
+        if os.path.isdir(filename_or_dir):
+            for root, dirs, files in os.walk(filename_or_dir):
+                log.info("Scanning directory: {}".format(root))
 
-            # Process the files
-            for file in files:
-                file_count += 1
-                full_path = os.path.join(root, file)
-                sha1 = is_pdf_by_sig(full_path)
-                if not sha1:
-                    continue
-                sha1 = str(sha1)
-                if fast_forwarding_until:
-                    if sha1 != fast_forwarding_until:
+                # Process the files
+                for file in files:
+                    file_count += 1
+                    full_path = os.path.join(root, file)
+                    sha1 = sha1_of_ebook(full_path, storage_directory, source_index)
+                    if not sha1:
                         continue
-                    fast_forwarding_until = None
+                    sha1 = str(sha1)
+                    if fast_forwarding_until:
+                        if sha1 != fast_forwarding_until:
+                            continue
+                        fast_forwarding_until = None
 
-                if _process_single_ebook(sha1, full_path,
-                                         tika_server_url, storage_directory,
-                                         gpt_client, model_deployment_to_use):
-                    ebook_count += 1
+                    if _process_single_ebook(sha1, full_path,
+                                             tika_server_url, storage_directory,
+                                             gpt_client, model_deployment_to_use,
+                                             _destination_for_path(destination, full_path,
+                                                                   filename_or_dir, bundle_from_path)):
+                        ebook_count += 1
 
-    elif os.path.isfile(filename_or_dir):
-        if fast_foward_sha1_hash:
-            raise ValueError("Argument error! Cannot fast foward on a single file.")
-        log.info("Scanning file: {}".format(filename_or_dir))
-        file_count = 1
-        sha1 = is_pdf_by_sig(filename_or_dir)
-        if not sha1:
-            raise ValueError(f"{filename_or_dir} is not a PDF-file!")
+        elif os.path.isfile(filename_or_dir):
+            if fast_foward_sha1_hash:
+                raise ValueError("Argument error! Cannot fast foward on a single file.")
+            log.info("Scanning file: {}".format(filename_or_dir))
+            file_count = 1
+            sha1 = sha1_of_ebook(filename_or_dir, storage_directory, source_index)
+            if not sha1:
+                raise ValueError(f"{filename_or_dir} is not a PDF-file!")
 
-        sha1 = str(sha1)
-        if _process_single_ebook(sha1, filename_or_dir,
-                                 tika_server_url, storage_directory,
-                                 gpt_client, model_deployment_to_use):
-            ebook_count += 1
+            sha1 = str(sha1)
+            if _process_single_ebook(sha1, filename_or_dir,
+                                     tika_server_url, storage_directory,
+                                     gpt_client, model_deployment_to_use,
+                                     destination):
+                ebook_count += 1
+    finally:
+        # Saved even if the run is cut short, so the hashing done so far isn't wasted.
+        if len(source_index) != hashes_known:
+            save_source_index(source_index, storage_directory)
 
     log.info("Did a total of {} files, {} e-books".format(file_count, ebook_count))
 
     return file_count
 
 
+def _bundle_name_from_path(filename: str, scanned_directory: str, level: int) -> Optional[str]:
+    """
+    Worker: Pick the name of an eBook bundle out of the path an eBook was found in
+    :param filename: PDF eBook being uploaded
+    :param scanned_directory: Directory the walk started from, which the level is counted from
+    :param level: Which directory below the scanned one names the bundle, 1 being the first
+    :return: Name of the eBook bundle, or none if the eBook sits above that level
+    """
+    relative_directory = os.path.relpath(os.path.dirname(filename), scanned_directory)
+    directories = [part for part in relative_directory.split(os.sep)
+                   if part and part != os.curdir]
+    if len(directories) < level:
+        # An eBook loose in the scanned directory, or one directly in a publisher directory
+        # of its own, is in no bundle. It still uploads, just without the association.
+        return None
+
+    return directories[level - 1]
+
+
+def _destination_for_path(destination: Optional[UploadDestination], filename: str,
+                          scanned_directory: str,
+                          bundle_from_path: int) -> Optional[UploadDestination]:
+    """
+    Worker: Point one upload at the eBook bundle named after the directory the eBook is in
+    :param destination: M-Files vault to upload into. If none given, nothing is uploaded.
+    :param filename: PDF eBook being uploaded
+    :param scanned_directory: Directory the walk started from
+    :param bundle_from_path: Directory level naming the bundle. 0 leaves the bundles as given.
+    :return: Destination to upload this one eBook with
+    """
+    if not destination or not bundle_from_path or not destination.bundle:
+        return destination
+
+    bundle_name = _bundle_name_from_path(filename, scanned_directory, bundle_from_path)
+    if not bundle_name:
+        log.debug("No bundle directory for {}".format(filename))
+        return destination
+
+    bundle_id = resolve_or_create_object(destination, destination.bundle, bundle_name)
+    if bundle_id in destination.bundle_ids:
+        return destination
+
+    # The resolved-name caches live in the shared ReferenceTarget objects, so this copy
+    # still knows every author, publisher and bundle the run has resolved so far. The
+    # bundles given with --collection stay on, as they apply to the whole run.
+    return replace(destination, bundle_ids=destination.bundle_ids + (bundle_id,))
+
+
+def find_ebook_by_source_sha1(destination: UploadDestination, sha1: str) -> Optional[dict]:
+    """
+    Worker: Look up an eBook the vault already holds by the SHA-1 of the file it was made of.
+
+    This is what keeps a second run, or a run whose local cache has been thrown away,
+    from uploading the same eBook all over again.
+
+    :param destination: M-Files vault and object type to search
+    :param sha1: SHA-1 hash of the PDF eBook
+    :return: ObjVer of the object the vault holds, or none if this eBook is new to it
+    """
+    source_sha1_property = destination.properties.get('source_sha1')
+    if not source_sha1_property:
+        # Without the property definition the vault has had nowhere to store the hash.
+        return None
+
+    matches = destination.client.get("objects?o={}&p{}={}".format(
+        destination.object_type_id, source_sha1_property, quote(sha1)
+    )).get('Items', [])
+    if not matches:
+        return None
+
+    if len(matches) > 1:
+        log.warning("Vault holds {} eBooks with source SHA-1 {}. Using object {}.".format(
+            len(matches), sha1, matches[0]['ObjVer']['ID']
+        ))
+
+    return matches[0]['ObjVer']
+
+
+def _set_checked_out(destination: UploadDestination, objver: dict, checked_out: bool) -> dict:
+    """
+    Worker: Check an object out of a vault for editing, or back into it
+    :param destination: Logged in M-Files vault
+    :param objver: ObjVer of the object to check out or in
+    :param checked_out: True to check the object out, False to check it back in
+    :return: Object version the vault reports, whose 'ObjVer' is the one to write to
+    """
+    return destination.client.put("objects/{}/{}/latest/checkedout".format(
+        objver['Type'], objver['ID']
+    ), json.dumps({"Value": checked_out}))
+
+
+def add_ebook_to_bundles(destination: UploadDestination, objver: dict) -> bool:
+    """
+    Worker: Add the eBook bundles of this copy to an eBook the vault already holds.
+
+    The very same eBook, SHA-1 and all, comes in several bundles, and is uploaded only
+    the first time it is met. The bundles of every later copy still have to reach that
+    one object, or the association is lost.
+
+    :param destination: M-Files vault and the eBook bundles this copy was found in
+    :param objver: ObjVer of the object the vault already holds
+    :return: True if the object gained a bundle it didn't have before
+    """
+    if not destination.bundle or not destination.bundle_ids:
+        return False
+
+    object_properties = destination.client.get("objects/{}/{}/latest/properties".format(
+        objver['Type'], objver['ID']
+    ))
+    bundle_ids = []
+    for property_value in object_properties:
+        if property_value['PropertyDef'] == destination.bundle.property_def_id:
+            bundle_ids = [lookup['Item']
+                          for lookup in property_value['TypedValue'].get('Lookups') or []]
+            break
+
+    missing_ids = [bundle_id for bundle_id in destination.bundle_ids
+                   if bundle_id not in bundle_ids]
+    if not missing_ids:
+        return False
+
+    # Setting a property replaces the whole of its value, so the bundles the object is
+    # already in have to be sent along with the new ones.
+    new_value = {
+        "PropertyDef": destination.bundle.property_def_id,
+        "TypedValue": {
+            "DataType": MFILES_DATATYPE_MULTISELECT_LOOKUP,
+            "Lookups": [
+                {
+                    "Item": bundle_id,
+                    "Version": -1
+                } for bundle_id in bundle_ids + missing_ids
+            ]
+        }
+    }
+
+    # A vault refuses to write a property of an object that isn't checked out:
+    # "The object is not checked out." (error code 178)
+    checked_out = _set_checked_out(destination, objver, True)
+    try:
+        destination.client.put("objects/{}/{}/{}/properties/{}".format(
+            objver['Type'], objver['ID'], checked_out['ObjVer']['Version'],
+            destination.bundle.property_def_id
+        ), json.dumps(new_value))
+    finally:
+        # Check in even if the write failed, rather than leave the object locked for
+        # everyone else. That costs an empty version, which beats a stuck import.
+        _set_checked_out(destination, objver, False)
+
+    log.info("Added object {} to {} more {}(s): {}".format(
+        objver['ID'], len(missing_ids), destination.bundle.name, missing_ids
+    ))
+
+    return True
+
+
 def _process_single_ebook(sha1: str, filename: str, tika_server_url: str, storage_directory: str,
-                          gpt_client: AzureOpenAI, model_deployment_to_use: str) -> bool:
+                          gpt_client: AzureOpenAI, model_deployment_to_use: str,
+                          destination: Optional[UploadDestination] = None) -> bool:
     """
     Worker: Process a single eBook
     :param sha1: SHA-1 hash of the filename content being processed
@@ -167,6 +490,7 @@ def _process_single_ebook(sha1: str, filename: str, tika_server_url: str, storag
     :param storage_directory: Local directory to store parsed data into
     :param gpt_client:
     :param model_deployment_to_use:
+    :param destination: M-Files vault to upload the eBook into. If none given, nothing is uploaded.
     :return:
     """
     # log.info("Parsing PDF file: {}".format(full_path))
@@ -180,11 +504,25 @@ def _process_single_ebook(sha1: str, filename: str, tika_server_url: str, storag
         parse_result['Content-Hash-SHA1'] = sha1
         _save_ebook(parse_result, storage_directory)
 
-    if 'ai-summary' in parse_result:
-        return True
+    if 'ai-summary' not in parse_result:
+        parse_result = generate_ai_summary(parse_result, gpt_client, model_deployment_to_use)
+        _save_ebook(parse_result, storage_directory)
 
-    enriched_parse_result = generate_ai_summary(parse_result, gpt_client, model_deployment_to_use)
-    _save_ebook(enriched_parse_result, storage_directory)
+    if destination:
+        # Uploading is done only once per eBook, however many bundles hold a copy of it.
+        # The local cache knows of an upload this or an earlier run did; the vault itself
+        # is asked in case that cache has since been thrown away.
+        objver = parse_result.get('mfiles-object') or find_ebook_by_source_sha1(destination, sha1)
+        if objver:
+            log.debug("Already uploaded {} as object {}".format(filename, objver['ID']))
+            # This copy may well be in a bundle the object isn't associated with yet.
+            added_bundles = add_ebook_to_bundles(destination, objver)
+            if added_bundles or 'mfiles-object' not in parse_result:
+                parse_result['mfiles-object'] = objver
+                _save_ebook(parse_result, storage_directory)
+        else:
+            parse_result['mfiles-object'] = upload_ebook(destination, filename, parse_result)
+            _save_ebook(parse_result, storage_directory)
 
     return True
 
@@ -319,11 +657,11 @@ def _load_ebook(filename: str, sha1: str, storage_directory: str) -> dict:
     :param storage_directory: Local directory to load parsed data from
     :return: Tika parsed metadata and XHTML content
     """
-    parsed_filename = os.path.join(storage_directory, f"{sha1}.bin")
-    if not should_rebuild(filename, parsed_filename):
+    cache_filename = parsed_filename(sha1, storage_directory)
+    if not should_rebuild(filename, cache_filename):
         # Return something we processed earlier
-        log.debug("Returning file {} data from cache: {}".format(filename, parsed_filename))
-        with open(parsed_filename, 'rb') as f:
+        log.debug("Returning file {} data from cache: {}".format(filename, cache_filename))
+        with open(cache_filename, 'rb') as f:
             data = pickle.load(f)
             data['Content-Hash-SHA1'] = sha1
 
@@ -342,8 +680,8 @@ def _save_ebook(parsed: dict, storage_directory: str) -> None:
     sha1 = parsed['Content-Hash-SHA1']
     if not sha1:
         raise ValueError("Internal error: Parsed dictionary doesn't have eBook SHA-1!")
-    parsed_filename = os.path.join(storage_directory, f"{sha1}.bin")
-    with open(parsed_filename, 'wb') as handle:
+    cache_filename = parsed_filename(sha1, storage_directory)
+    with open(cache_filename, 'wb') as handle:
         pickle.dump(parsed, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
 
@@ -373,14 +711,7 @@ def generate_ai_summary(parsed_ebook: dict,
         return parsed_ebook
 
     # Go LLM!
-    # Try to extract the filename for logging purposes. It can be very tricky!
-    filename = parsed_ebook["metadata"]["resourceName"]
-    if isinstance(filename, list):
-        filename = filename[0]
-    try:
-        filename = ast.literal_eval(filename).decode("utf-8")
-    except:
-        pass
+    filename = _resource_filename(parsed_ebook)
     log.debug("Generating summary for {}".format(filename))
     result = query_gpt(gpt_client, model_deployment_to_use, first_pages)
 
@@ -515,18 +846,686 @@ Text for analysis:
     return response
 
 
-def upload(server_address: str, user: str, password: str, vault: str) -> None:
+def _first_metadata_value(value) -> Optional[str]:
+    """
+    Helper: Apache Tika returns a metadata value either as a string or as a list of them
+    :param value: A single Tika metadata value
+    :return: The value as a string or None if there is nothing
+    """
+    if isinstance(value, list):
+        value = value[0] if value else None
+    if value is None:
+        return None
+
+    return str(value).strip() or None
+
+
+def _resource_filename(parsed_ebook: dict) -> Optional[str]:
+    """
+    Helper: Dig the original filename out of Tika metadata. It can be very tricky!
+    :param parsed_ebook: Tika parsed metadata and XHTML content
+    :return: Original filename of the eBook or None if Tika didn't state any
+    """
+    filename = _first_metadata_value(parsed_ebook.get('metadata', {}).get('resourceName'))
+    if not filename:
+        return None
+
+    # Tika likes to hand out the name as a repr() of Python bytes, e.g. "b'A Book.pdf'"
+    try:
+        filename = ast.literal_eval(filename).decode("utf-8")
+    except (AttributeError, SyntaxError, UnicodeDecodeError, ValueError):
+        pass
+
+    return filename
+
+
+def _truncate_text(value: str, separator: str = " ") -> str:
+    """
+    Helper: Make a value fit into an M-Files text property without cutting from the middle of a word
+    :param value: Value to fit
+    :param separator: Boundary to cut the value at
+    :return: Value no longer than a text property can hold
+    """
+    if len(value) <= MFILES_TEXT_PROPERTY_MAX_LENGTH:
+        return value
+
+    truncated = value[:MFILES_TEXT_PROPERTY_MAX_LENGTH]
+    boundary = truncated.rfind(separator)
+    if boundary > 0:
+        truncated = truncated[:boundary]
+
+    return truncated.rstrip(" ,")
+
+
+def _ebook_title(parsed_ebook: dict, filename: str) -> str:
+    """
+    Helper: Figure out a name for the M-Files object.
+    LLM knows best, PDF metadata is second best and the filename is the last resort.
+    :param parsed_ebook: Tika parsed metadata and XHTML content with AI summary
+    :param filename: PDF eBook being uploaded
+    :return: Title of the eBook
+    """
+    ai_title = _first_metadata_value(parsed_ebook.get('ai-summary', {}).get('book_title'))
+    if ai_title:
+        return _truncate_text(ai_title)
+
+    pdf_title = _first_metadata_value(parsed_ebook.get('metadata', {}).get('dc:title'))
+    if pdf_title:
+        return _truncate_text(pdf_title)
+
+    title = os.path.splitext(_resource_filename(parsed_ebook) or os.path.basename(filename))[0]
+
+    return _truncate_text(title)
+
+
+def _ebook_comment(parsed_ebook: dict, destination: UploadDestination) -> str:
+    """
+    Helper: Collect into the built-in multi-line 'Comment' property the bibliographic
+    data that has nowhere better to go: the parts no property definition covers, and
+    the parts this vault happens to be missing the property definition for.
+    :param parsed_ebook: Tika parsed metadata and XHTML content with AI summary
+    :param destination: M-Files vault with the resolved property definitions
+    :return: Multi-line comment. Empty string if there is nothing to say.
+    """
+    ai_summary = parsed_ebook.get('ai-summary', {})
+    metadata = parsed_ebook.get('metadata', {})
+
+    lines = []
+    if ai_summary.get('authors') and not destination.author:
+        lines.append("Author(s): {}".format(", ".join(ai_summary['authors'])))
+    if ai_summary.get('publisher') and not destination.publisher:
+        lines.append("Publisher: {}".format(ai_summary['publisher']))
+    if ai_summary.get('publishing_year') and 'publishing_year' not in destination.properties:
+        lines.append("Published: {}".format(ai_summary['publishing_year']))
+    if ai_summary.get('isbn'):
+        # Every ISBN of the eBook. The property only holds the one that identifies it best.
+        lines.append("ISBN: {}".format(", ".join(ai_summary['isbn'])))
+    if ai_summary.get('keywords'):
+        # Every keyword. The 'Keywords' text property only holds the first 100 characters of them.
+        lines.append("Keywords: {}".format(", ".join(ai_summary['keywords'])))
+    pages = _first_metadata_value(metadata.get('xmpTPg:NPages'))
+    if pages and 'page_count' not in destination.properties:
+        lines.append("Pages: {}".format(pages))
+    original_filename = _resource_filename(parsed_ebook)
+    if original_filename:
+        lines.append("Original filename: {}".format(original_filename))
+    if 'source_sha1' not in destination.properties:
+        lines.append("SHA-1: {}".format(parsed_ebook['Content-Hash-SHA1']))
+
+    return "\n".join(lines)
+
+
+def _ebook_property_values(destination: UploadDestination, parsed_ebook: dict, filename: str) -> list[dict]:
+    """
+    Worker: Build the M-Files PropertyValues of an eBook object out of parsed eBook data
+    :param destination: M-Files vault, object class and document collections to upload into
+    :param parsed_ebook: Tika parsed metadata and XHTML content with AI summary
+    :param filename: PDF eBook being uploaded
+    :return: List of M-Files PropertyValue structures
+    """
+    property_values = [
+        {
+            "PropertyDef": MFILES_PROPERTY_NAME_OR_TITLE,
+            "TypedValue": {
+                "DataType": MFILES_DATATYPE_TEXT,
+                "Value": _ebook_title(parsed_ebook, filename)
+            }
+        },
+        {
+            "PropertyDef": MFILES_PROPERTY_CLASS,
+            "TypedValue": {
+                "DataType": MFILES_DATATYPE_LOOKUP,
+                "Lookup": {
+                    "Item": destination.object_class_id,
+                    "Version": -1
+                }
+            }
+        },
+        {
+            # Single-file mode is a 'Document' only thing. A vault will flat out refuse
+            # to create an object of any other type in it: "Cannot set document to single-file mode."
+            "PropertyDef": MFILES_PROPERTY_SINGLE_FILE,
+            "TypedValue": {
+                "DataType": MFILES_DATATYPE_BOOLEAN,
+                "Value": destination.object_type_id == MFILES_OBJECT_TYPE_DOCUMENT
+            }
+        }
+    ]
+
+    keywords = parsed_ebook.get('ai-summary', {}).get('keywords')
+    if keywords:
+        # Only as many complete keywords as a text property can hold. The full list is in the comment.
+        property_values.append({
+            "PropertyDef": MFILES_PROPERTY_KEYWORDS,
+            "TypedValue": {
+                "DataType": MFILES_DATATYPE_TEXT,
+                "Value": _truncate_text(", ".join(keywords), separator=",")
+            }
+        })
+
+    comment = _ebook_comment(parsed_ebook, destination)
+    if comment:
+        property_values.append({
+            "PropertyDef": MFILES_PROPERTY_COMMENT,
+            "TypedValue": {
+                "DataType": MFILES_DATATYPE_MULTILINE_TEXT,
+                "Value": comment
+            }
+        })
+
+    property_values.extend(_bibliographic_property_values(destination, parsed_ebook))
+
+    ai_summary = parsed_ebook.get('ai-summary', {})
+
+    # Link the eBook to author and publisher objects, creating the ones the vault
+    # doesn't have yet.
+    for target, names in ((destination.author, ai_summary.get('authors')),
+                          (destination.publisher, ai_summary.get('publisher'))):
+        reference = _reference_property_value(destination, target, names)
+        if reference:
+            property_values.append(reference)
+
+    if destination.owner_property_def_id:
+        # The eBook object type is owned by the bundle object type. A vault refuses to
+        # create the object without its one owner, and won't take a list of them either.
+        property_values.append({
+            "PropertyDef": destination.owner_property_def_id,
+            "TypedValue": {
+                "DataType": MFILES_DATATYPE_LOOKUP,
+                "Lookup": {
+                    "Item": destination.bundle_ids[0],
+                    "Version": -1
+                }
+            }
+        })
+    elif destination.bundle and destination.bundle_ids:
+        # Associate the eBook with the existing bundle objects given as user input
+        property_values.append({
+            "PropertyDef": destination.bundle.property_def_id,
+            "TypedValue": {
+                "DataType": MFILES_DATATYPE_MULTISELECT_LOOKUP,
+                "Lookups": [
+                    {
+                        "Item": bundle_id,
+                        "Version": -1
+                    } for bundle_id in destination.bundle_ids
+                ]
+            }
+        })
+
+    return property_values
+
+
+def upload_ebook(destination: UploadDestination, filename: str, parsed_ebook: dict) -> dict:
+    """
+    Worker: Upload a single PDF eBook into an M-Files vault as a new object
+    :param destination: M-Files vault, object type / class and document collections to upload into
+    :param filename: PDF eBook to upload
+    :param parsed_ebook: Tika parsed metadata and XHTML content with AI summary
+    :return: ObjVer of the created object. Has keys 'Type', 'ID' and 'Version'.
+    """
     # API docs:
     # https://developer.m-files.com/APIs/REST-API/
     # Community:
     # https://community.m-files.com/forums-1552881334/f/m-files-api
-    my_client = mfiles.MFilesClient(server=server_address,
-                                    user=user,
-                                    password=password,
-                                    vault=vault)
 
-    print(my_client)
-    # log.
+    # Push the bytes into vault's temporary upload storage
+    log.debug("Uploading file {}".format(filename))
+    with open(filename, 'rb') as file_stream:
+        upload_info = destination.client.post("files", file_stream.read())
+    if 'UploadID' not in upload_info:
+        raise ValueError("Internal error: M-Files didn't return an UploadID for {}!".format(filename))
+
+    # Create the object out of the uploaded file and the metadata we know of it
+    file_title, file_extension = os.path.splitext(os.path.basename(filename))
+    new_object = {
+        "PropertyValues": _ebook_property_values(destination, parsed_ebook, filename),
+        "Files": [
+            {
+                "UploadID": upload_info["UploadID"],
+                "Title": file_title,
+                "Extension": file_extension.lstrip("."),
+                "Size": upload_info["Size"]
+            }
+        ]
+    }
+    log.debug("Creating object: {}".format(json.dumps(new_object)))
+    created_object = destination.client.post(
+        "objects/{}".format(destination.object_type_id), json.dumps(new_object)
+    )
+
+    if 'ObjVer' not in created_object:
+        raise ValueError("Internal error: M-Files didn't return an ObjVer for created {}!".format(filename))
+    log.info("Uploaded {} as object {} version {}".format(
+        filename, created_object['ObjVer']['ID'], created_object['ObjVer']['Version']
+    ))
+
+    return created_object['ObjVer']
+
+
+def parse_object_ids(object_ids: Optional[str], what: str) -> tuple[int, ...]:
+    """
+    Helper: Convert user input of comma-separated object IDs into integers
+    :param object_ids: Comma-separated list of M-Files object IDs
+    :param what: What the IDs are expected to point at, for the error message
+    :return: Tuple of object IDs
+    """
+    if not object_ids:
+        return ()
+
+    parsed_ids = []
+    for object_id in str(object_ids).split(","):
+        object_id = object_id.strip()
+        if not object_id:
+            continue
+        if not object_id.isdigit():
+            raise ValueError("{} '{}' is not an M-Files object ID!".format(what, object_id))
+        parsed_ids.append(int(object_id))
+
+    return tuple(parsed_ids)
+
+
+def _resolve_reference_target(client: mfiles.MFilesClient, object_type_name: str) -> ReferenceTarget:
+    """
+    Helper: Resolve an object type an eBook refers to, the class to create its objects
+    as and the property definition an eBook uses to point at them.
+    :param client: Logged in M-Files vault
+    :param object_type_name: Name of the object type, for example 'Author'
+    :return: Resolved reference target
+    """
+    object_type = client.get_info(object_type_name, mfiles.MFilesClient.CategoryType.OBJECT_TYPE)
+    object_type_id = object_type['ID']
+
+    # An object type needs a class before any object of it can be created. A vault
+    # makes one automatically, but an admin is free to add more.
+    classes = [c for c in client.classes() if c.get('ObjectType') == object_type_id]
+    if not classes:
+        raise ValueError("Object type '{}' has no class defined in the vault!".format(object_type_name))
+    if len(classes) > 1:
+        raise ValueError("Object type '{}' has {} classes. Don't know which one to use: {}".format(
+            object_type_name, len(classes), ", ".join(c['Name'] for c in classes)
+        ))
+
+    # The reference property is the multi-select lookup reading off this object type's
+    # value list. A vault creates it along with the object type itself. Its single-select
+    # 'Owner (...)' twin reads off the same list, hence the data type check.
+    references = [
+        p for p in client.properties()
+        if p.get('ValueList') == object_type_id and p.get('DataType') == MFILES_DATATYPE_MULTISELECT_LOOKUP
+    ]
+    if not references:
+        raise ValueError(
+            "No multi-select lookup property definition pointing at object type '{}' in the vault!".format(
+                object_type_name
+            )
+        )
+    # More than one is legitimate, an admin may have added their own. The automatic
+    # one carries the name of the object type, so prefer that.
+    reference = next(
+        (p for p in references if p['Name'].casefold() == object_type_name.casefold()), references[0]
+    )
+
+    target = ReferenceTarget(
+        name=object_type_name,
+        object_type_id=object_type_id,
+        object_class_id=classes[0]['ID'],
+        property_def_id=reference['ID']
+    )
+    log.info("Linking {} ({}) with class {} ({}) through property '{}' ({})".format(
+        object_type_name, target.object_type_id, classes[0]['Name'], target.object_class_id,
+        reference['Name'], target.property_def_id
+    ))
+
+    return target
+
+
+def _resolve_optional_reference_target(client: mfiles.MFilesClient,
+                                       object_type_name: Optional[str]) -> Optional[ReferenceTarget]:
+    """
+    Helper: Resolve a reference target the vault structure isn't required to have (yet).
+    Uploading without the link is better than refusing to upload at all.
+    :param client: Logged in M-Files vault
+    :param object_type_name: Name of the object type. None or empty disables the linking.
+    :return: Resolved reference target, or None if it cannot be resolved
+    """
+    if not object_type_name:
+        return None
+
+    try:
+        return _resolve_reference_target(client, object_type_name)
+    except (ValueError, MFilesException) as e:
+        # WARNING is the default log level, so this is visible without asking for it.
+        log.warning("Not linking uploads to '{}': {}".format(object_type_name, e))
+        return None
+
+
+def resolve_or_create_object(destination: UploadDestination, target: ReferenceTarget, name: str) -> int:
+    """
+    Worker: Find an object by name, creating it if the vault doesn't have it yet.
+    :param destination: Logged in M-Files vault
+    :param target: Object type, class and name cache to resolve within
+    :param name: Name or title of the object, for example 'Ada Lovelace'
+    :return: Object ID of the existing or newly created object
+    """
+    name = _truncate_text(name)
+    cached = target.resolved.get(name.casefold())
+    if cached is not None:
+        return cached
+
+    # p0 filters on 'Name or title'. An exact match, unlike a quick search.
+    endpoint = "objects?o={}&p0={}".format(target.object_type_id, quote(name))
+    matches = destination.client.get(endpoint).get('Items', [])
+    if matches:
+        object_id = matches[0]['ObjVer']['ID']
+        if len(matches) > 1:
+            log.warning("Vault has {} objects named '{}' of type {}. Using {}.".format(
+                len(matches), name, target.name, object_id
+            ))
+        log.debug("Resolved {} '{}' to object {}".format(target.name, name, object_id))
+    else:
+        new_object = {
+            "PropertyValues": [
+                {
+                    "PropertyDef": MFILES_PROPERTY_NAME_OR_TITLE,
+                    "TypedValue": {
+                        "DataType": MFILES_DATATYPE_TEXT,
+                        "Value": name
+                    }
+                },
+                {
+                    "PropertyDef": MFILES_PROPERTY_CLASS,
+                    "TypedValue": {
+                        "DataType": MFILES_DATATYPE_LOOKUP,
+                        "Lookup": {
+                            "Item": target.object_class_id,
+                            "Version": -1
+                        }
+                    }
+                },
+                {
+                    # Single-file mode is a 'Document' only thing, and these never are one.
+                    "PropertyDef": MFILES_PROPERTY_SINGLE_FILE,
+                    "TypedValue": {
+                        "DataType": MFILES_DATATYPE_BOOLEAN,
+                        "Value": False
+                    }
+                }
+            ]
+        }
+        created = destination.client.post(
+            "objects/{}".format(target.object_type_id), json.dumps(new_object)
+        )
+        if 'ObjVer' not in created:
+            raise ValueError("Internal error: M-Files didn't return an ObjVer for {} '{}'!".format(
+                target.name, name
+            ))
+        object_id = created['ObjVer']['ID']
+        log.info("Created {} '{}' as object {}".format(target.name, name, object_id))
+
+    target.resolved[name.casefold()] = object_id
+
+    return object_id
+
+
+def _reference_property_value(destination: UploadDestination, target: Optional[ReferenceTarget],
+                              names) -> Optional[dict]:
+    """
+    Helper: Build one multi-select lookup PropertyValue, resolving or creating
+    every object it points at along the way.
+    :param destination: Logged in M-Files vault
+    :param target: Object type to link to. None if the vault has no such structure.
+    :param names: Names of the objects to link to. A single name or a list of them.
+    :return: M-Files PropertyValue structure. None if there is nothing to link.
+    """
+    if not target or not names:
+        return None
+
+    if isinstance(names, str):
+        names = [names]
+
+    lookups = []
+    for name in names:
+        name = (name or "").strip()
+        if not name:
+            continue
+        lookups.append({"Item": resolve_or_create_object(destination, target, name), "Version": -1})
+
+    if not lookups:
+        return None
+
+    return {
+        "PropertyDef": target.property_def_id,
+        "TypedValue": {
+            "DataType": MFILES_DATATYPE_MULTISELECT_LOOKUP,
+            "Lookups": lookups
+        }
+    }
+
+
+def _resolve_ebook_properties(client: mfiles.MFilesClient) -> dict[str, int]:
+    """
+    Helper: Resolve the vault property definitions holding bibliographic data. A vault
+    isn't required to have them, so anything missing is reported and skipped rather than
+    treated as an error.
+    :param client: Logged in M-Files vault
+    :return: Property definition IDs of the ones this vault has, keyed as in EBOOK_PROPERTIES
+    """
+    # Resolved by hand rather than through get_info(): its CategoryType.PROPERTY_TYPE
+    # is a duplicate of CLASS_TYPE and so resolves property names against classes.
+    by_name = {p['Name'].casefold(): p for p in client.properties()}
+
+    resolved = {}
+    for key, (property_name, data_type) in EBOOK_PROPERTIES.items():
+        property_definition = by_name.get(property_name.casefold())
+        if not property_definition:
+            # WARNING is the default log level, so this is visible without asking for it.
+            log.warning("Vault has no '{}' property definition. Not storing it.".format(property_name))
+            continue
+        if property_definition['DataType'] != data_type:
+            log.warning("Property '{}' ({}) is of data type {}, expected {}. Not storing it.".format(
+                property_name, property_definition['ID'], property_definition['DataType'], data_type
+            ))
+            continue
+        resolved[key] = property_definition['ID']
+        log.info("Storing {} in property '{}' ({})".format(key, property_name, property_definition['ID']))
+
+    return resolved
+
+
+def _as_integer(value) -> Optional[int]:
+    """
+    Helper: Coerce an LLM or Tika supplied value into an integer
+    :param value: Value of any type. A list is read as its first item.
+    :return: The value as an integer, or None if it isn't one
+    """
+    value = _first_metadata_value(value)
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return None
+
+
+def _preferred_isbn(isbns) -> Optional[str]:
+    """
+    Helper: Pick the one ISBN a single value text property can hold. A 13 digit ISBN
+    supersedes the 10 digit one, so prefer the longest.
+    :param isbns: ISBNs the LLM found. A single ISBN or a list of them.
+    :return: The ISBN to store, or None if there is none
+    """
+    if isinstance(isbns, str):
+        isbns = [isbns]
+    candidates = [str(i).strip() for i in (isbns or []) if str(i).strip()]
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda isbn: len(re.sub(r"[^0-9Xx]", "", isbn)))
+
+
+def _bibliographic_property_values(destination: UploadDestination, parsed_ebook: dict) -> list[dict]:
+    """
+    Worker: Build the PropertyValues of the bibliographic data an eBook has its own
+    property definitions for. Skips the ones the vault doesn't have, and the ones
+    neither the LLM nor Tika could tell.
+    :param destination: M-Files vault with the resolved property definitions
+    :param parsed_ebook: Tika parsed metadata and XHTML content with AI summary
+    :return: List of M-Files PropertyValue structures
+    """
+    ai_summary = parsed_ebook.get('ai-summary', {})
+    values = {
+        'isbn': _preferred_isbn(ai_summary.get('isbn')),
+        'publishing_year': _as_integer(ai_summary.get('publishing_year')),
+        'page_count': _as_integer(parsed_ebook.get('metadata', {}).get('xmpTPg:NPages')),
+        'source_sha1': parsed_ebook.get('Content-Hash-SHA1'),
+    }
+
+    property_values = []
+    for key, value in values.items():
+        property_def_id = destination.properties.get(key)
+        if property_def_id is None or value is None:
+            continue
+        data_type = EBOOK_PROPERTIES[key][1]
+        property_values.append({
+            "PropertyDef": property_def_id,
+            "TypedValue": {
+                "DataType": data_type,
+                "Value": value if data_type == MFILES_DATATYPE_INTEGER else _truncate_text(str(value))
+            }
+        })
+
+    return property_values
+
+
+def _resolve_owner_property(client: mfiles.MFilesClient, object_type_name: str,
+                            owner_type_id: Optional[int], bundle: Optional[ReferenceTarget],
+                            bundle_ids: tuple[int, ...], bundle_type_name: str) -> Optional[int]:
+    """
+    Helper: Work out the property definition that names the owner of an uploaded eBook.
+    An owned object type is a strict one-to-many hierarchy: the vault refuses to create
+    an object without its single owner, so the user input has to name exactly one.
+    :param client: Logged in M-Files vault
+    :param object_type_name: Name of the object type eBooks are created as
+    :param owner_type_id: Object type owning that one. None when there is no owner.
+    :param bundle: Resolved object type the --collection object IDs are of
+    :param bundle_ids: Object IDs given as user input
+    :param bundle_type_name: Name the user gave for the bundle object type
+    :return: Property definition ID of the owner, or None when the object type has no owner
+    """
+    if not owner_type_id:
+        return None
+
+    owner_type = next((o for o in client.objects() if o['ID'] == owner_type_id), None)
+    if not owner_type:
+        raise ValueError("Object type '{}' is owned by unknown object type {}!".format(
+            object_type_name, owner_type_id
+        ))
+
+    if not bundle or bundle.object_type_id != owner_type_id:
+        raise ValueError("Object type '{}' is owned by '{}', not by '{}'. Use --bundle-type '{}'.".format(
+            object_type_name, owner_type['Name'], bundle_type_name, owner_type['Name']
+        ))
+    if len(bundle_ids) != 1:
+        raise ValueError(
+            "Object type '{}' is owned by '{}', so every upload needs exactly one --collection "
+            "object ID. Got {}. Turn the owner off in M-Files Admin to associate an eBook with "
+            "several bundles.".format(object_type_name, owner_type['Name'], len(bundle_ids))
+        )
+
+    log.info("Object type '{}' is owned by '{}'. Setting owner through property {}.".format(
+        object_type_name, owner_type['Name'], owner_type['OwnerPropertyDef']
+    ))
+
+    return owner_type['OwnerPropertyDef']
+
+
+def connect_to_vault(server_address: str, user: str, password: str, vault: Optional[str],
+                     object_type_name: str, object_class_name: str,
+                     bundle_type_name: Optional[str], bundle_ids: tuple[int, ...],
+                     author_type_name: Optional[str],
+                     publisher_type_name: Optional[str],
+                     bundles_from_path: bool = False) -> UploadDestination:
+    """
+    Worker: Log into an M-Files vault and resolve everything an upload needs from the vault structure
+    :param server_address: M-Files Vault REST API URL endpoint
+    :param user: M-Files Vault username
+    :param password: M-Files Vault password
+    :param vault: M-Files Vault GUID. If none given, the first vault user has access to is used.
+    :param object_type_name: Name of the object type to create eBooks as
+    :param object_class_name: Name of the object class to create eBooks as
+    :param bundle_type_name: Name of the object type the eBook bundles are
+    :param bundle_ids: Existing eBook bundle objects to associate the eBooks with
+    :param author_type_name: Name of the object type to link authors to
+    :param publisher_type_name: Name of the object type to link publishers to
+    :param bundles_from_path: Whether bundles are to be named after the directories being scanned
+    :return: Logged in vault ready to be uploaded into
+    """
+    client = mfiles.MFilesClient(server=server_address,
+                                 user=user,
+                                 password=password,
+                                 vault=vault)
+    client.login()
+    log.debug("Logged into vault {}".format(client.vault))
+
+    object_type = client.get_info(object_type_name, mfiles.MFilesClient.CategoryType.OBJECT_TYPE)
+    if not object_type.get('CanHaveFiles'):
+        raise ValueError("Object type '{}' cannot have files in it!".format(object_type_name))
+    object_class = client.get_info(object_class_name, mfiles.MFilesClient.CategoryType.CLASS_TYPE)
+    if object_class.get('ObjectType') != object_type['ID']:
+        raise ValueError("Object class '{}' is not a class of object type '{}'!".format(
+            object_class_name, object_type_name
+        ))
+    log.info("Uploading as {} ({}), class {} ({})".format(
+        object_type_name, object_type['ID'], object_class_name, object_class['ID']
+    ))
+
+    # An owner relationship in the vault structure makes the owning object mandatory
+    # on every single upload. Bundles were asked for by object ID, so either way the
+    # object type has to be resolved to verify them against.
+    owner_type_id = object_type['Owner'] if object_type.get('HasOwner') else None
+    bundle = _resolve_reference_target(client, bundle_type_name) \
+        if (bundle_ids or owner_type_id or bundles_from_path) else None
+    owner_property_def_id = _resolve_owner_property(
+        client, object_type_name, owner_type_id, bundle, bundle_ids, bundle_type_name
+    )
+
+    destination = UploadDestination(
+        client=client,
+        object_type_id=object_type['ID'],
+        object_class_id=object_class['ID'],
+        bundle=bundle,
+        bundle_ids=bundle_ids,
+        author=_resolve_optional_reference_target(client, author_type_name),
+        publisher=_resolve_optional_reference_target(client, publisher_type_name),
+        owner_property_def_id=owner_property_def_id,
+        properties=_resolve_ebook_properties(client)
+    )
+    _verify_bundles(destination)
+
+    return destination
+
+
+def _verify_bundles(destination: UploadDestination) -> None:
+    """
+    Helper: Make sure the eBook bundles given as user input really are existing
+    objects of that type in the vault. Fail early if they are not.
+    :param destination: M-Files vault and the eBook bundles to verify
+    :return:
+    """
+    if not destination.bundle:
+        return
+
+    for bundle_id in destination.bundle_ids:
+        endpoint = "objects/{}/{}/latest".format(destination.bundle.object_type_id, bundle_id)
+        try:
+            bundle = destination.client.get(endpoint)
+        except MFilesException as e:
+            raise ValueError("{} object ID {} doesn't exist in vault {}!".format(
+                destination.bundle.name, bundle_id, destination.client.vault
+            )) from e
+        log.info("Will associate uploads with {} {}: {}".format(
+            destination.bundle.name, bundle_id, bundle.get('Title')
+        ))
 
 
 def main():
@@ -550,6 +1549,40 @@ def main():
                         help="M-Files Vault password")
     parser.add_argument('--vault',
                         help="M-Files Vault GUID. If none given, will default to first vault user has access to.")
+    parser.add_argument('--object-type',
+                        default='eBook',
+                        help="M-Files object type to create the uploads as. Default: eBook")
+    parser.add_argument('--object-class',
+                        default='eBook',
+                        help="M-Files object class to create the uploads as. Default: eBook")
+    parser.add_argument('--collection',
+                        metavar='OBJECT-IDS',
+                        help="Comma-separated list of existing M-Files eBook bundle object IDs "
+                             "to associate the uploaded eBooks with")
+    parser.add_argument('--bundle-type',
+                        default='eBook bundle',
+                        help="M-Files object type the --collection object IDs are of. "
+                             "Default: eBook bundle")
+    parser.add_argument('--bundle-from-path',
+                        metavar='LEVEL',
+                        type=int,
+                        default=0,
+                        help="Name the eBook bundle of every upload after a directory the eBook is "
+                             "found in, resolving or creating the bundle object as needed. LEVEL "
+                             "picks which directory below the one being scanned gives the name: "
+                             "1 for 'bundle/book.pdf', 2 for 'publisher/bundle/book.pdf'. Any "
+                             "--collection bundles are added on top. Default: 0, disabled")
+    parser.add_argument('--author-type',
+                        default='Author',
+                        help="M-Files object type to link the authors of an eBook to. "
+                             "Empty disables the linking. Default: Author")
+    parser.add_argument('--publisher-type',
+                        default='Publisher',
+                        help="M-Files object type to link the publisher of an eBook to. "
+                             "Empty disables the linking. Default: Publisher")
+    parser.add_argument('--parse-only',
+                        action='store_true',
+                        help="Only parse and enrich the eBooks, don't upload anything into the vault")
     parser.add_argument('--tika-server-url',
                         required=True,
                         help="Tika server URL endpoint")
@@ -577,14 +1610,35 @@ def main():
     _setup_logger(args)
     truststore.inject_into_ssl()
 
+    destination = None
+    if args.parse_only:
+        log.info("Parse-only run. Nothing will be uploaded into a vault.")
+    else:
+        try:
+            bundle_ids = parse_object_ids(args.collection, args.bundle_type)
+        except ValueError as e:
+            parser.error(str(e))
+
+        if args.bundle_from_path < 0:
+            parser.error("--bundle-from-path is a directory level, counted from 1!")
+
+        destination = connect_to_vault(
+            args.rest_api_url, args.username, args.password, args.vault,
+            args.object_type, args.object_class,
+            args.bundle_type, bundle_ids,
+            args.author_type, args.publisher_type,
+            args.bundle_from_path > 0
+        )
+
     gpt_client, gpt_model = initialize_gpt_client(args.gpt_url, args.gpt_key)
     parse_files(
         args.ebook,
         args.tika_server_url, args.storage_directory,
         gpt_client, gpt_model,
-        args.skip_into
+        destination,
+        args.skip_into,
+        args.bundle_from_path
     )
-    upload(args.rest_api_url, args.username, args.password, args.vault)
 
 
 if __name__ == '__main__':
