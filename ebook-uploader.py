@@ -91,6 +91,8 @@ class UploadDestination:
     bundle_ids: tuple[int, ...] = field(default_factory=tuple)
     author: Optional[ReferenceTarget] = None
     publisher: Optional[ReferenceTarget] = None
+    # Set when the publisher is taken from the directory tree instead of the eBook itself.
+    publisher_name: Optional[str] = None
     # Set when the eBook object type is owned by the bundle object type. An owner is a
     # single mandatory value instead of an optional multi-select reference.
     owner_property_def_id: Optional[int] = None
@@ -255,7 +257,7 @@ def parse_files(filename_or_dir: str, tika_server_url: str, storage_directory: s
                 gpt_client: AzureOpenAI, model_deployment_to_use: str,
                 destination: Optional[UploadDestination] = None,
                 fast_foward_sha1_hash: Optional[str] = None,
-                bundle_from_path: int = 0) -> int:
+                bundle_from_path: int = 0, publisher_from_path: int = 0) -> int:
     """
     Worker: Wrap
     :param filename_or_dir: File to parse or diretory to recurse for file
@@ -266,6 +268,7 @@ def parse_files(filename_or_dir: str, tika_server_url: str, storage_directory: s
     :param destination: M-Files vault to upload the eBooks into. If none given, nothing is uploaded.
     :param fast_foward_sha1_hash: SHA1 hash to use for fast foward
     :param bundle_from_path: Directory level naming the eBook bundle. 0 leaves the bundles as given.
+    :param publisher_from_path: Directory level naming the publisher. 0 leaves it to the eBook.
     :return: count of files processed
     """
     file_count = 0
@@ -295,7 +298,9 @@ def parse_files(filename_or_dir: str, tika_server_url: str, storage_directory: s
                                              tika_server_url, storage_directory,
                                              gpt_client, model_deployment_to_use,
                                              _destination_for_path(destination, full_path,
-                                                                   filename_or_dir, bundle_from_path)):
+                                                                   filename_or_dir,
+                                                                   bundle_from_path,
+                                                                   publisher_from_path)):
                         ebook_count += 1
 
         elif os.path.isfile(filename_or_dir):
@@ -323,52 +328,68 @@ def parse_files(filename_or_dir: str, tika_server_url: str, storage_directory: s
     return file_count
 
 
-def _bundle_name_from_path(filename: str, scanned_directory: str, level: int) -> Optional[str]:
+def _directory_name_from_path(filename: str, scanned_directory: str,
+                              level: int) -> Optional[str]:
     """
-    Worker: Pick the name of an eBook bundle out of the path an eBook was found in
+    Worker: Pick one directory name out of the path an eBook was found in
     :param filename: PDF eBook being uploaded
     :param scanned_directory: Directory the walk started from, which the level is counted from
-    :param level: Which directory below the scanned one names the bundle, 1 being the first
-    :return: Name of the eBook bundle, or none if the eBook sits above that level
+    :param level: Which directory below the scanned one to take, 1 being the first
+    :return: Name of that directory, or none if the eBook sits above that level
     """
     relative_directory = os.path.relpath(os.path.dirname(filename), scanned_directory)
     directories = [part for part in relative_directory.split(os.sep)
                    if part and part != os.curdir]
     if len(directories) < level:
         # An eBook loose in the scanned directory, or one directly in a publisher directory
-        # of its own, is in no bundle. It still uploads, just without the association.
+        # of its own, has no directory at that level. It still uploads, just without
+        # whatever that directory would have named.
         return None
 
     return directories[level - 1]
 
 
 def _destination_for_path(destination: Optional[UploadDestination], filename: str,
-                          scanned_directory: str,
-                          bundle_from_path: int) -> Optional[UploadDestination]:
+                          scanned_directory: str, bundle_from_path: int,
+                          publisher_from_path: int) -> Optional[UploadDestination]:
     """
-    Worker: Point one upload at the eBook bundle named after the directory the eBook is in
+    Worker: Point one upload at the bundle and publisher named after the directories the eBook is in
     :param destination: M-Files vault to upload into. If none given, nothing is uploaded.
     :param filename: PDF eBook being uploaded
     :param scanned_directory: Directory the walk started from
     :param bundle_from_path: Directory level naming the bundle. 0 leaves the bundles as given.
+    :param publisher_from_path: Directory level naming the publisher. 0 leaves it to the eBook.
     :return: Destination to upload this one eBook with
     """
-    if not destination or not bundle_from_path or not destination.bundle:
+    if not destination or not (bundle_from_path or publisher_from_path):
         return destination
 
-    bundle_name = _bundle_name_from_path(filename, scanned_directory, bundle_from_path)
-    if not bundle_name:
-        log.debug("No bundle directory for {}".format(filename))
-        return destination
+    changes = {}
 
-    bundle_id = resolve_or_create_object(destination, destination.bundle, bundle_name)
-    if bundle_id in destination.bundle_ids:
+    if bundle_from_path and destination.bundle:
+        bundle_name = _directory_name_from_path(filename, scanned_directory, bundle_from_path)
+        if not bundle_name:
+            log.debug("No bundle directory for {}".format(filename))
+        else:
+            bundle_id = resolve_or_create_object(destination, destination.bundle, bundle_name)
+            if bundle_id not in destination.bundle_ids:
+                # The bundles given with --collection stay on, as they apply to the whole run.
+                changes['bundle_ids'] = destination.bundle_ids + (bundle_id,)
+
+    if publisher_from_path:
+        publisher_name = _directory_name_from_path(filename, scanned_directory,
+                                                   publisher_from_path)
+        if not publisher_name:
+            log.debug("No publisher directory for {}".format(filename))
+        else:
+            changes['publisher_name'] = publisher_name
+
+    if not changes:
         return destination
 
     # The resolved-name caches live in the shared ReferenceTarget objects, so this copy
-    # still knows every author, publisher and bundle the run has resolved so far. The
-    # bundles given with --collection stay on, as they apply to the whole run.
-    return replace(destination, bundle_ids=destination.bundle_ids + (bundle_id,))
+    # still knows every author, publisher and bundle the run has resolved so far.
+    return replace(destination, **changes)
 
 
 def find_ebook_by_source_sha1(destination: UploadDestination, sha1: str) -> Optional[dict]:
@@ -479,6 +500,102 @@ def add_ebook_to_bundles(destination: UploadDestination, objver: dict) -> bool:
     return True
 
 
+def _property_lookups(object_properties: list, property_def_id: int) -> list:
+    """
+    Helper: Pick the lookup values of one property out of an object's properties
+    :param object_properties: Properties of an object, as the vault returns them
+    :param property_def_id: Property definition to look for
+    :return: Its lookup values, empty if the object doesn't have that property
+    """
+    for property_value in object_properties:
+        if property_value['PropertyDef'] == property_def_id:
+            return property_value['TypedValue'].get('Lookups') or []
+
+    return []
+
+
+def _property_text(object_properties: list, property_def_id: int) -> str:
+    """
+    Helper: Pick the text value of one property out of an object's properties
+    :param object_properties: Properties of an object, as the vault returns them
+    :param property_def_id: Property definition to look for
+    :return: Its value, empty if the object doesn't have that property
+    """
+    for property_value in object_properties:
+        if property_value['PropertyDef'] == property_def_id:
+            return property_value['TypedValue'].get('Value') or ""
+
+    return ""
+
+
+def reconcile_ebook_publisher(destination: UploadDestination, objver: dict) -> bool:
+    """
+    Worker: Point an eBook already in the vault at the publisher this run names.
+
+    An eBook is given its publisher when it is uploaded, so an eBook uploaded before the
+    publisher was known would otherwise keep whatever its title page claimed. Where the
+    two disagree the title page is not discarded but written into the comment, the same
+    place an upload would have put it.
+
+    :param destination: M-Files vault to upload into, naming the publisher of this run
+    :param objver: ObjVer of the eBook object already in the vault
+    :return: Whether the publisher had to be changed
+    """
+    if not destination.publisher or not destination.publisher_name:
+        return False
+
+    publisher_id = resolve_or_create_object(destination, destination.publisher,
+                                            destination.publisher_name)
+    object_properties = destination.client.get("objects/{}/{}/latest/properties".format(
+        objver['Type'], objver['ID']
+    ))
+    current = _property_lookups(object_properties, destination.publisher.property_def_id)
+    if [lookup['Item'] for lookup in current] == [publisher_id]:
+        return False
+
+    new_values = [{
+        "PropertyDef": destination.publisher.property_def_id,
+        "TypedValue": {
+            "DataType": MFILES_DATATYPE_MULTISELECT_LOOKUP,
+            "Lookups": [{"Item": publisher_id, "Version": -1}]
+        }
+    }]
+
+    replaced = ", ".join(lookup.get('DisplayValue') or "" for lookup in current).strip(", ")
+    comment = _property_text(object_properties, MFILES_PROPERTY_COMMENT)
+    kept_line = "Publisher named in the eBook: {}".format(replaced)
+    if replaced and kept_line not in comment:
+        new_values.append({
+            "PropertyDef": MFILES_PROPERTY_COMMENT,
+            "TypedValue": {
+                "DataType": MFILES_DATATYPE_MULTILINE_TEXT,
+                "Value": "\n".join(line for line in (comment, kept_line) if line)
+            }
+        })
+
+    # Both properties go into one checkout, so the object gains a single version rather
+    # than one per property. A vault refuses to write a property of an object that isn't
+    # checked out: "The object is not checked out." (error code 178)
+    checked_out = _set_checked_out(destination, objver, True)
+    try:
+        for new_value in new_values:
+            destination.client.put("objects/{}/{}/{}/properties/{}".format(
+                objver['Type'], objver['ID'], checked_out['ObjVer']['Version'],
+                new_value['PropertyDef']
+            ), json.dumps(new_value))
+    finally:
+        # Check in even if a write failed, rather than leave the object locked for
+        # everyone else. That costs an empty version, which beats a stuck import.
+        _set_checked_out(destination, objver, False)
+
+    log.info("Object {} publisher is now '{}'{}".format(
+        objver['ID'], destination.publisher_name,
+        ", was '{}'".format(replaced) if replaced else ", had none"
+    ))
+
+    return True
+
+
 def _process_single_ebook(sha1: str, filename: str, tika_server_url: str, storage_directory: str,
                           gpt_client: AzureOpenAI, model_deployment_to_use: str,
                           destination: Optional[UploadDestination] = None) -> bool:
@@ -517,7 +634,9 @@ def _process_single_ebook(sha1: str, filename: str, tika_server_url: str, storag
             log.debug("Already uploaded {} as object {}".format(filename, objver['ID']))
             # This copy may well be in a bundle the object isn't associated with yet.
             added_bundles = add_ebook_to_bundles(destination, objver)
-            if added_bundles or 'mfiles-object' not in parse_result:
+            # The publisher may have been unknown, or known worse, when it was uploaded.
+            changed_publisher = reconcile_ebook_publisher(destination, objver)
+            if added_bundles or changed_publisher or 'mfiles-object' not in parse_result:
                 parse_result['mfiles-object'] = objver
                 _save_ebook(parse_result, storage_directory)
         else:
@@ -935,6 +1054,11 @@ def _ebook_comment(parsed_ebook: dict, destination: UploadDestination) -> str:
         lines.append("Author(s): {}".format(", ".join(ai_summary['authors'])))
     if ai_summary.get('publisher') and not destination.publisher:
         lines.append("Publisher: {}".format(ai_summary['publisher']))
+    elif ai_summary.get('publisher') and destination.publisher_name \
+            and ai_summary['publisher'] != destination.publisher_name:
+        # The eBook itself named a different publisher than the directory it was filed under.
+        # The property holds the filed one; this keeps what the eBook said from being lost.
+        lines.append("Publisher named in the eBook: {}".format(ai_summary['publisher']))
     if ai_summary.get('publishing_year') and 'publishing_year' not in destination.properties:
         lines.append("Published: {}".format(ai_summary['publishing_year']))
     if ai_summary.get('isbn'):
@@ -1018,9 +1142,12 @@ def _ebook_property_values(destination: UploadDestination, parsed_ebook: dict, f
     ai_summary = parsed_ebook.get('ai-summary', {})
 
     # Link the eBook to author and publisher objects, creating the ones the vault
-    # doesn't have yet.
+    # doesn't have yet. A publisher named after the directory tree beats the one read off
+    # the eBook: the tree names each publisher once, whereas title pages of the same house
+    # say Microsoft, Microsoft Press and Microsoft Corporation between them.
     for target, names in ((destination.author, ai_summary.get('authors')),
-                          (destination.publisher, ai_summary.get('publisher'))):
+                          (destination.publisher,
+                           destination.publisher_name or ai_summary.get('publisher'))):
         reference = _reference_property_value(destination, target, names)
         if reference:
             property_values.append(reference)
@@ -1572,6 +1699,20 @@ def main():
                              "picks which directory below the one being scanned gives the name: "
                              "1 for 'bundle/book.pdf', 2 for 'publisher/bundle/book.pdf'. Any "
                              "--collection bundles are added on top. Default: 0, disabled")
+    parser.add_argument('--publisher',
+                        metavar='NAME',
+                        help="Publisher of every eBook of this run, overriding the one read off "
+                             "the eBook itself. For scanning a single publisher's directory, "
+                             "whose own name no --publisher-from-path level can reach. Default: "
+                             "use the eBook")
+    parser.add_argument('--publisher-from-path',
+                        metavar='LEVEL',
+                        type=int,
+                        default=0,
+                        help="Take the publisher of every upload from a directory the eBook is "
+                             "found in rather than from the eBook itself, LEVEL counted as for "
+                             "--bundle-from-path. A directory names its publisher once, where "
+                             "title pages of one house vary. Default: 0, use the eBook")
     parser.add_argument('--author-type',
                         default='Author',
                         help="M-Files object type to link the authors of an eBook to. "
@@ -1619,8 +1760,10 @@ def main():
         except ValueError as e:
             parser.error(str(e))
 
-        if args.bundle_from_path < 0:
-            parser.error("--bundle-from-path is a directory level, counted from 1!")
+        for level_argument, level in (('--bundle-from-path', args.bundle_from_path),
+                                     ('--publisher-from-path', args.publisher_from_path)):
+            if level < 0:
+                parser.error("{} is a directory level, counted from 1!".format(level_argument))
 
         destination = connect_to_vault(
             args.rest_api_url, args.username, args.password, args.vault,
@@ -1630,6 +1773,15 @@ def main():
             args.bundle_from_path > 0
         )
 
+        if (args.publisher_from_path or args.publisher) and not destination.publisher:
+            parser.error("--publisher and --publisher-from-path need a --publisher-type to "
+                         "link the publishers to!")
+
+        # A directory level, where there is one, names the publisher better than a literal
+        # given for the whole run, so --publisher stands in only where no level reaches.
+        if args.publisher:
+            destination = replace(destination, publisher_name=args.publisher)
+
     gpt_client, gpt_model = initialize_gpt_client(args.gpt_url, args.gpt_key)
     parse_files(
         args.ebook,
@@ -1637,7 +1789,8 @@ def main():
         gpt_client, gpt_model,
         destination,
         args.skip_into,
-        args.bundle_from_path
+        args.bundle_from_path,
+        args.publisher_from_path
     )
 
 
