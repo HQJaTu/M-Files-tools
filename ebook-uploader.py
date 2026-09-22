@@ -1015,6 +1015,20 @@ def _first_metadata_value(value) -> Optional[str]:
     return str(value).strip() or None
 
 
+def _is_bytes_repr_fragment(value: str) -> bool:
+    """
+    Helper: Tell whether a value is the opening half of a repr() of Python bytes, left
+    unterminated because the name it holds was cut at a comma, e.g. "b'How I Rob Banks"
+    :param value: A metadata value that ast.literal_eval already refused
+    :return: Whether it opens as a bytes literal without closing as one
+    """
+    for quote in ("b'", 'b"'):
+        if value.startswith(quote) and not value.endswith(quote[1]):
+            return True
+
+    return False
+
+
 def _resource_filename(parsed_ebook: dict) -> Optional[str]:
     """
     Helper: Dig the original filename out of Tika metadata. It can be very tricky!
@@ -1030,6 +1044,15 @@ def _resource_filename(parsed_ebook: dict) -> Optional[str]:
         filename = ast.literal_eval(filename).decode("utf-8")
     except (AttributeError, SyntaxError, UnicodeDecodeError, ValueError):
         pass
+
+    # A name holding a comma reaches us already cut at it, with the repr left unterminated:
+    # "b'How I Rob Banks". literal_eval refuses that, and what survives is neither the name
+    # nor a usable part of one, so it is worth less than nothing in a metadata trail. The
+    # rest of the name is not recoverable here -- Tika never handed it over -- but the
+    # callers all have the file itself to fall back on, which carries the true name.
+    if _is_bytes_repr_fragment(filename):
+        log.info("Tika gave a truncated filename ({}). Using the file's own name.".format(filename))
+        return None
 
     return filename
 
