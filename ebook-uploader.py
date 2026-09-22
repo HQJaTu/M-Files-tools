@@ -62,7 +62,7 @@ EBOOK_PROPERTIES = {
     # belongs to the version it was written on and is not carried forward, so the trail
     # vanishes the first time anything else writes to the eBook. A vault without this
     # definition still gets a trail, in 'Comment', with the warning that says so.
-    'source_metadata': ("Source metadata", MFILES_DATATYPE_MULTILINE_TEXT),
+    'source_metadata': ("Source", MFILES_DATATYPE_MULTILINE_TEXT),
 }
 
 
@@ -1015,46 +1015,54 @@ def _first_metadata_value(value) -> Optional[str]:
     return str(value).strip() or None
 
 
-def _is_bytes_repr_fragment(value: str) -> bool:
+def _is_mangled_repr(value: str, real_name: str) -> bool:
     """
-    Helper: Tell whether a value is the opening half of a repr() of Python bytes, left
-    unterminated because the name it holds was cut at a comma, e.g. "b'How I Rob Banks"
-    :param value: A metadata value that ast.literal_eval already refused
-    :return: Whether it opens as a bytes literal without closing as one
+    Helper: Tell whether Tika's filename is the wreckage of a repr() of Python bytes
+    rather than a name, judged against the name the file actually has.
+    :param value: Filename as Tika stated it
+    :param real_name: Basename of the file the eBook was read from
+    :return: Whether the value is a mangled repr
     """
-    for quote in ("b'", 'b"'):
-        if value.startswith(quote) and not value.endswith(quote[1]):
+    # "b'Art of Memory Forensics" and "bShellcoder's Handbook.pdf" both become the opening
+    # of the real name once the repr's leftovers come off. A name that merely starts with
+    # a b is left alone, because it matches the file as it stands.
+    for stripped in (value[2:], value[1:]):
+        if stripped and real_name.startswith(stripped):
             return True
 
-    return False
+    return value.startswith("b'") or value.startswith('b"')
 
 
-def _resource_filename(parsed_ebook: dict) -> Optional[str]:
+def _resource_filename(parsed_ebook: dict, path: Optional[str] = None) -> Optional[str]:
     """
     Helper: Dig the original filename out of Tika metadata. It can be very tricky!
     :param parsed_ebook: Tika parsed metadata and XHTML content
+    :param path: Path the eBook was read from, to fall back on when Tika mangles the name
     :return: Original filename of the eBook or None if Tika didn't state any
     """
-    filename = _first_metadata_value(parsed_ebook.get('metadata', {}).get('resourceName'))
-    if not filename:
-        return None
+    real_name = os.path.basename(path) if path else None
+    name = _first_metadata_value(parsed_ebook.get('metadata', {}).get('resourceName'))
+    if not name:
+        return real_name
 
     # Tika likes to hand out the name as a repr() of Python bytes, e.g. "b'A Book.pdf'"
     try:
-        filename = ast.literal_eval(filename).decode("utf-8")
+        name = ast.literal_eval(name).decode("utf-8")
     except (AttributeError, SyntaxError, UnicodeDecodeError, ValueError):
         pass
 
-    # A name holding a comma reaches us already cut at it, with the repr left unterminated:
-    # "b'How I Rob Banks". literal_eval refuses that, and what survives is neither the name
-    # nor a usable part of one, so it is worth less than nothing in a metadata trail. The
-    # rest of the name is not recoverable here -- Tika never handed it over -- but the
-    # callers all have the file itself to fall back on, which carries the true name.
-    if _is_bytes_repr_fragment(filename):
-        log.info("Tika gave a truncated filename ({}). Using the file's own name.".format(filename))
-        return None
+    # When that repr does not come out whole, Tika mangles it three ways, all of which
+    # reached the vault: cut at the first comma with the quote left on ("b'How I Rob
+    # Banks"), stripped of its quotes with the b left on ("bShellcoder's Handbook.pdf"),
+    # or both at once ("bReal-World Python"). Only the first looks wrong at a glance,
+    # which is how the second sat in 53 trail lines passing for a name starting with b.
+    # What Tika cut it never handed over, so the name is not recoverable from it -- but
+    # the file itself carries the name, and that is what the trail wanted all along.
+    if real_name and name != real_name and _is_mangled_repr(name, real_name):
+        log.info("Tika mangled the filename ({}). Using the file's own name.".format(name))
+        return real_name
 
-    return filename
+    return name
 
 
 def _truncate_text(value: str, separator: str = " ") -> str:
@@ -1091,7 +1099,8 @@ def _ebook_title(parsed_ebook: dict, filename: str) -> str:
     if pdf_title:
         return _truncate_text(pdf_title)
 
-    title = os.path.splitext(_resource_filename(parsed_ebook) or os.path.basename(filename))[0]
+    title = os.path.splitext(_resource_filename(parsed_ebook, filename)
+                             or os.path.basename(filename))[0]
 
     return _truncate_text(title)
 
@@ -1100,18 +1109,20 @@ def _trail_property_def(destination: UploadDestination) -> int:
     """
     Helper: Work out the property definition the metadata trail is written to.
     :param destination: M-Files vault with the resolved property definitions
-    :return: Property definition ID of 'Source metadata', or of 'Comment' without it
+    :return: Property definition ID of 'Source', or of 'Comment' without it
     """
     return destination.properties.get('source_metadata', MFILES_PROPERTY_COMMENT)
 
 
-def _ebook_source_metadata(parsed_ebook: dict, destination: UploadDestination) -> str:
+def _ebook_source_metadata(parsed_ebook: dict, destination: UploadDestination,
+                           filename: str) -> str:
     """
-    Helper: Collect into the multi-line 'Source metadata' property the bibliographic
+    Helper: Collect into the multi-line 'Source' property the bibliographic
     data that has nowhere better to go: the parts no property definition covers, and
     the parts this vault happens to be missing the property definition for.
     :param parsed_ebook: Tika parsed metadata and XHTML content with AI summary
     :param destination: M-Files vault with the resolved property definitions
+    :param filename: Path the eBook was read from
     :return: Multi-line trail. Empty string if there is nothing to say.
     """
     ai_summary = parsed_ebook.get('ai-summary', {})
@@ -1138,7 +1149,7 @@ def _ebook_source_metadata(parsed_ebook: dict, destination: UploadDestination) -
     pages = _first_metadata_value(metadata.get('xmpTPg:NPages'))
     if pages and 'page_count' not in destination.properties:
         lines.append("Pages: {}".format(pages))
-    original_filename = _resource_filename(parsed_ebook)
+    original_filename = _resource_filename(parsed_ebook, filename)
     if original_filename:
         lines.append("Original filename: {}".format(original_filename))
     if 'source_sha1' not in destination.properties:
@@ -1195,7 +1206,7 @@ def _ebook_property_values(destination: UploadDestination, parsed_ebook: dict, f
             }
         })
 
-    trail = _ebook_source_metadata(parsed_ebook, destination)
+    trail = _ebook_source_metadata(parsed_ebook, destination, filename)
     if trail:
         property_values.append({
             "PropertyDef": _trail_property_def(destination),
@@ -1708,7 +1719,7 @@ def connect_to_vault(server_address: str, user: str, password: str, vault: Optio
         properties=_resolve_ebook_properties(client)
     )
     if 'source_metadata' not in destination.properties:
-        # The resolver has just said it is not storing 'Source metadata'. The trail is
+        # The resolver has just said it is not storing 'Source'. The trail is
         # still written, to M-Files' predefined 'Comment' -- which is where it used to
         # go, and which loses it as soon as the eBook gains a version. Said plainly here
         # so a vault missing the definition is a known limp rather than a silent one.
