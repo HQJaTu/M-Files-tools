@@ -93,6 +93,10 @@ class UploadDestination:
     publisher: Optional[ReferenceTarget] = None
     # Set when the publisher is taken from the directory tree instead of the eBook itself.
     publisher_name: Optional[str] = None
+    # Whether an eBook already in the vault may be moved off a publisher it already has.
+    # Off by default: a tree that mixes publishers would otherwise silently overwrite the
+    # right answer with the name of whichever directory is being scanned.
+    repoint_publisher: bool = False
     # Set when the eBook object type is owned by the bundle object type. An owner is a
     # single mandatory value instead of an optional multi-select reference.
     owner_property_def_id: Optional[int] = None
@@ -537,6 +541,12 @@ def reconcile_ebook_publisher(destination: UploadDestination, objver: dict) -> b
     two disagree the title page is not discarded but written into the comment, the same
     place an upload would have put it.
 
+    Filling in a publisher the eBook has none of is always safe. Moving one it already
+    has is not: the same file often sits in two trees, and a mixed collection filed under
+    one publisher's directory would drag correctly filed books onto that publisher purely
+    because it was scanned second. So a disagreement is reported and left alone unless
+    --repoint-publisher says otherwise.
+
     :param destination: M-Files vault to upload into, naming the publisher of this run
     :param objver: ObjVer of the eBook object already in the vault
     :return: Whether the publisher had to be changed
@@ -551,6 +561,18 @@ def reconcile_ebook_publisher(destination: UploadDestination, objver: dict) -> b
     ))
     current = _property_lookups(object_properties, destination.publisher.property_def_id)
     if [lookup['Item'] for lookup in current] == [publisher_id]:
+        return False
+
+    if current and not destination.repoint_publisher:
+        # WARNING is the default log level, so a run that changes nothing still lists
+        # every book it would have moved. That listing is the dry run for --repoint-publisher.
+        log.warning("Object {} ('{}') is already published by '{}', not moving it to '{}'. "
+                    "Use --repoint-publisher to override.".format(
+                        objver['ID'],
+                        _property_text(object_properties, MFILES_PROPERTY_NAME_OR_TITLE),
+                        ", ".join(lookup.get('DisplayValue') or "" for lookup in current),
+                        destination.publisher_name
+                    ))
         return False
 
     new_values = [{
@@ -1708,6 +1730,12 @@ def main():
                              "the eBook itself. For scanning a single publisher's directory, "
                              "whose own name no --publisher-from-path level can reach. Default: "
                              "use the eBook")
+    parser.add_argument('--repoint-publisher',
+                        action='store_true',
+                        help="Move eBooks already in the vault onto this run's publisher even "
+                             "when they already have a different one. Without it such an eBook "
+                             "is left alone and logged, so a plain run lists what this would "
+                             "change. Default: leave existing publishers alone")
     parser.add_argument('--publisher-from-path',
                         metavar='LEVEL',
                         type=int,
@@ -1784,6 +1812,8 @@ def main():
         # given for the whole run, so --publisher stands in only where no level reaches.
         if args.publisher:
             destination = replace(destination, publisher_name=args.publisher)
+        if args.repoint_publisher:
+            destination = replace(destination, repoint_publisher=True)
 
     gpt_client, gpt_model = initialize_gpt_client(args.gpt_url, args.gpt_key)
     parse_files(
