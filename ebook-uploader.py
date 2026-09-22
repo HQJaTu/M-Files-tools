@@ -58,6 +58,11 @@ EBOOK_PROPERTIES = {
     'publishing_year': ("Publishing year", MFILES_DATATYPE_INTEGER),
     'page_count': ("Page count", MFILES_DATATYPE_INTEGER),
     'source_sha1': ("Source SHA-1", MFILES_DATATYPE_TEXT),
+    # Where the metadata trail goes. Not M-Files' predefined 'Comment' (33): that one
+    # belongs to the version it was written on and is not carried forward, so the trail
+    # vanishes the first time anything else writes to the eBook. A vault without this
+    # definition still gets a trail, in 'Comment', with the warning that says so.
+    'source_metadata': ("Source metadata", MFILES_DATATYPE_MULTILINE_TEXT),
 }
 
 
@@ -584,17 +589,18 @@ def reconcile_ebook_publisher(destination: UploadDestination, objver: dict) -> b
     }]
 
     replaced = ", ".join(lookup.get('DisplayValue') or "" for lookup in current).strip(", ")
-    comment = _property_text(object_properties, MFILES_PROPERTY_COMMENT)
+    trail_property_def = _trail_property_def(destination)
+    trail = _property_text(object_properties, trail_property_def)
     # What is being replaced is the vault's publisher, which is not always the one the
     # eBook names: a book filed under --publisher keeps the cover's reading in the line
     # written at upload, and a later repoint moves it off a name the cover never carried.
     kept_line = "Previous publisher in the vault: {}".format(replaced)
-    if replaced and kept_line not in comment:
+    if replaced and kept_line not in trail:
         new_values.append({
-            "PropertyDef": MFILES_PROPERTY_COMMENT,
+            "PropertyDef": trail_property_def,
             "TypedValue": {
                 "DataType": MFILES_DATATYPE_MULTILINE_TEXT,
-                "Value": "\n".join(line for line in (comment, kept_line) if line)
+                "Value": "\n".join(line for line in (trail, kept_line) if line)
             }
         })
 
@@ -690,6 +696,11 @@ def parse_file(filename: str, tika_server_url: str, storage_directory: str) -> d
             xmlContent=True,
             requestOptions={
                 "verify": True,
+                # The tika package defaults to 60 seconds, which a long book can exceed:
+                # a 470-page cookbook took Tika about 106. The client then hangs up mid-parse
+                # and Tika fails writing the response to a closed socket, which reads in its
+                # log like a serialization bug rather than the timeout it actually is.
+                "timeout": 300,
             }
         )
     except Exception as e:
@@ -1062,14 +1073,23 @@ def _ebook_title(parsed_ebook: dict, filename: str) -> str:
     return _truncate_text(title)
 
 
-def _ebook_comment(parsed_ebook: dict, destination: UploadDestination) -> str:
+def _trail_property_def(destination: UploadDestination) -> int:
     """
-    Helper: Collect into the built-in multi-line 'Comment' property the bibliographic
+    Helper: Work out the property definition the metadata trail is written to.
+    :param destination: M-Files vault with the resolved property definitions
+    :return: Property definition ID of 'Source metadata', or of 'Comment' without it
+    """
+    return destination.properties.get('source_metadata', MFILES_PROPERTY_COMMENT)
+
+
+def _ebook_source_metadata(parsed_ebook: dict, destination: UploadDestination) -> str:
+    """
+    Helper: Collect into the multi-line 'Source metadata' property the bibliographic
     data that has nowhere better to go: the parts no property definition covers, and
     the parts this vault happens to be missing the property definition for.
     :param parsed_ebook: Tika parsed metadata and XHTML content with AI summary
     :param destination: M-Files vault with the resolved property definitions
-    :return: Multi-line comment. Empty string if there is nothing to say.
+    :return: Multi-line trail. Empty string if there is nothing to say.
     """
     ai_summary = parsed_ebook.get('ai-summary', {})
     metadata = parsed_ebook.get('metadata', {})
@@ -1152,13 +1172,13 @@ def _ebook_property_values(destination: UploadDestination, parsed_ebook: dict, f
             }
         })
 
-    comment = _ebook_comment(parsed_ebook, destination)
-    if comment:
+    trail = _ebook_source_metadata(parsed_ebook, destination)
+    if trail:
         property_values.append({
-            "PropertyDef": MFILES_PROPERTY_COMMENT,
+            "PropertyDef": _trail_property_def(destination),
             "TypedValue": {
                 "DataType": MFILES_DATATYPE_MULTILINE_TEXT,
-                "Value": comment
+                "Value": trail
             }
         })
 
@@ -1435,12 +1455,24 @@ def _reference_property_value(destination: UploadDestination, target: Optional[R
     if isinstance(names, str):
         names = [names]
 
-    lookups = []
+    # Deduplicated by resolved ID, not by name: a vault matches lookup names loosely, so
+    # two spellings the eBook itself disagrees on land on one object. 'Roland Huß' and
+    # 'Roland Huss' off one title page resolved to the same Author, and the vault then
+    # refused the whole eBook with "The provided list of 3 items for object type 102
+    # contains at least one duplicate item." Comparing the names beforehand would not
+    # have caught it. First spelling seen wins, so the order the eBook lists them in holds.
+    lookups, seen = [], set()
     for name in names:
         name = (name or "").strip()
         if not name:
             continue
-        lookups.append({"Item": resolve_or_create_object(destination, target, name), "Version": -1})
+        object_id = resolve_or_create_object(destination, target, name)
+        if object_id in seen:
+            log.info("Skipping '{}': it is object {}, already linked through another "
+                     "spelling".format(name, object_id))
+            continue
+        seen.add(object_id)
+        lookups.append({"Item": object_id, "Version": -1})
 
     if not lookups:
         return None
@@ -1652,6 +1684,13 @@ def connect_to_vault(server_address: str, user: str, password: str, vault: Optio
         owner_property_def_id=owner_property_def_id,
         properties=_resolve_ebook_properties(client)
     )
+    if 'source_metadata' not in destination.properties:
+        # The resolver has just said it is not storing 'Source metadata'. The trail is
+        # still written, to M-Files' predefined 'Comment' -- which is where it used to
+        # go, and which loses it as soon as the eBook gains a version. Said plainly here
+        # so a vault missing the definition is a known limp rather than a silent one.
+        log.warning("Writing the metadata trail to 'Comment' ({}) instead. A later "
+                    "version of an eBook will not carry it.".format(MFILES_PROPERTY_COMMENT))
     _verify_bundles(destination)
 
     return destination
