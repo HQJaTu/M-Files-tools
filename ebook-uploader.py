@@ -563,7 +563,10 @@ def reconcile_ebook_publisher(destination: UploadDestination, objver: dict) -> b
 
     replaced = ", ".join(lookup.get('DisplayValue') or "" for lookup in current).strip(", ")
     comment = _property_text(object_properties, MFILES_PROPERTY_COMMENT)
-    kept_line = "Publisher named in the eBook: {}".format(replaced)
+    # What is being replaced is the vault's publisher, which is not always the one the
+    # eBook names: a book filed under --publisher keeps the cover's reading in the line
+    # written at upload, and a later repoint moves it off a name the cover never carried.
+    kept_line = "Previous publisher in the vault: {}".format(replaced)
     if replaced and kept_line not in comment:
         new_values.append({
             "PropertyDef": MFILES_PROPERTY_COMMENT,
