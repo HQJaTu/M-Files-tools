@@ -47,6 +47,9 @@ MFILES_DATATYPE_MULTILINE_TEXT = 13
 # A vault will silently truncate anything longer in a text (not multi-line text) property.
 MFILES_TEXT_PROPERTY_MAX_LENGTH = 100
 
+# What calculate_sha1() produces: lowercase hex.
+SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
+
 # Index of which SHA-1 each eBook hashed to, kept in the storage directory next to the
 # parsed data it names. Lets a re-run skip hashing the eBooks it already knows.
 SOURCE_INDEX_FILENAME = "source-index.json"
@@ -190,6 +193,11 @@ def parsed_filename(sha1: str, storage_directory: str) -> str:
     :param storage_directory: Local directory the parsed data is stored in
     :return: Path of the cache file
     """
+    # Hashes also come back out of the on-disk index. Anything but a bare hash could
+    # name a file outside the storage directory.
+    if not SHA1_PATTERN.fullmatch(sha1):
+        raise ValueError("Not a SHA-1 hash: {!r}".format(sha1))
+
     return os.path.join(storage_directory, "{}.bin".format(sha1))
 
 
@@ -247,6 +255,9 @@ def sha1_of_ebook(filename: str, storage_directory: str, index: dict) -> str | b
     """
     absolute_path = os.path.abspath(filename)
     known_sha1 = index.get(absolute_path)
+    if not (isinstance(known_sha1, str) and SHA1_PATTERN.fullmatch(known_sha1)):
+        # Not in the index, or the index has been damaged: hash the file again.
+        known_sha1 = None
     if known_sha1 and not should_rebuild(filename, parsed_filename(known_sha1, storage_directory)):
         log.debug("Metadata of {} is newer than the eBook, not hashing it again".format(filename))
         return known_sha1
