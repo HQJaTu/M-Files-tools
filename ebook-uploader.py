@@ -12,7 +12,7 @@ import pickle
 import re
 from dataclasses import dataclass, field, replace
 from http import HTTPStatus
-from typing import Optional
+from typing import Optional, cast
 from urllib.parse import quote
 
 import configargparse
@@ -398,7 +398,7 @@ def _destination_for_path(destination: Optional[UploadDestination], filename: st
 
     # The resolved-name caches live in the shared ReferenceTarget objects, so this copy
     # still knows every author, publisher and bundle the run has resolved so far.
-    return replace(destination, **changes)
+    return cast(UploadDestination, replace(destination, **changes))
 
 
 def find_ebook_by_source_sha1(destination: UploadDestination, sha1: str) -> Optional[dict]:
@@ -645,7 +645,7 @@ def _process_single_ebook(sha1: str, filename: str, tika_server_url: str, storag
 
     parse_result = _load_ebook(filename, sha1, storage_directory)
     if not parse_result:
-        parse_result = parse_file(filename, tika_server_url, storage_directory)
+        parse_result = parse_file(filename, tika_server_url)
         if 'xhtml' not in parse_result:
             return False
 
@@ -677,12 +677,11 @@ def _process_single_ebook(sha1: str, filename: str, tika_server_url: str, storag
     return True
 
 
-def parse_file(filename: str, tika_server_url: str, storage_directory: str) -> dict:
+def parse_file(filename: str, tika_server_url: str) -> dict:
     """
     Worker
     :param filename: PDF eBook to parse with Apache Tika
     :param tika_server_url: Apache Tika URL to use for parsing
-    :param storage_directory: Local directory to store parsed data into
     :return: Parsed data
     """
     log.info("Parsing file {}".format(filename))
@@ -704,7 +703,7 @@ def parse_file(filename: str, tika_server_url: str, storage_directory: str) -> d
             }
         )
     except Exception as e:
-        log.error("Error parsing file: {}".format(e))
+        log.exception("Error parsing file: {}".format(e))
         return {}
 
     if not parsed or 'status' not in parsed:
@@ -795,12 +794,6 @@ def parse_file(filename: str, tika_server_url: str, storage_directory: str) -> d
 
     # Looking good!
     parsed['xhtml'] = xhtml
-
-    if False:
-        content_filename = os.path.join(storage_directory, f"{sha1}.bin")
-        with open(content_filename, "w", encoding="utf-8") as f:
-            f.write(xhtml)
-        log.info("Wrote content into {}".format(content_filename))
 
     return parsed
 
@@ -993,9 +986,9 @@ Text for analysis:
             model=model_deployment_to_use
         )
     except BadRequestError as e:
-        log.error(f"Failing content: {first_pages_of_the_book}")
-        log.error(e.body["message"])
-        log.error(e.body["innererror"]["content_filter_result"])
+        log.exception("{}\nContent filter result: {}\nFailing content: {}".format(
+            e.body["message"], e.body["innererror"]["content_filter_result"], first_pages_of_the_book
+        ))
         raise
 
     return response
@@ -1030,7 +1023,7 @@ def _is_mangled_repr(value: str, real_name: str) -> bool:
         if stripped and real_name.startswith(stripped):
             return True
 
-    return value.startswith("b'") or value.startswith('b"')
+    return value.startswith(("b'", 'b"'))
 
 
 def _resource_filename(parsed_ebook: dict, path: Optional[str] = None) -> Optional[str]:
@@ -1048,7 +1041,7 @@ def _resource_filename(parsed_ebook: dict, path: Optional[str] = None) -> Option
     # Tika likes to hand out the name as a repr() of Python bytes, e.g. "b'A Book.pdf'"
     try:
         name = ast.literal_eval(name).decode("utf-8")
-    except (AttributeError, SyntaxError, UnicodeDecodeError, ValueError):
+    except (AttributeError, SyntaxError, ValueError):
         pass
 
     # When that repr does not come out whole, Tika mangles it three ways, all of which
