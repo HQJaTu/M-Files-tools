@@ -42,8 +42,9 @@ def test_timestamp_roundtrip_is_utc():
 
 
 def test_naive_datetime_is_refused():
+    naive = datetime.datetime(2026, 9, 23)
     with pytest.raises(ValueError, match="tzinfo"):
-        values.timestamp(datetime.datetime(2026, 9, 23))
+        values.timestamp(naive)
 
 
 def test_date_roundtrip():

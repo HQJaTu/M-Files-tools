@@ -26,7 +26,8 @@ def test_grpc_section_is_optional(tmp_path):
     path = tmp_path / "client-config.toml"
     path.write_text(CONFIG.split("[m-files.tool.grpc]")[0])
     s = load_settings(str(path))
-    assert s.session_header is None and s.session_encoding == "hex"
+    assert s.session_header is None
+    assert s.session_encoding == "hex"
 
 
 def test_repr_hides_password(tmp_path):
