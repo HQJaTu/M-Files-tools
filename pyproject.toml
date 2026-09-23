@@ -25,7 +25,7 @@ dependencies = [
     "keyring==25.7.0",
     "tika==3.1.0",
     #mfiles==0.5.3",
-    "mfiles @ file:../python-mfiles",
+    "mfiles @ git+https://github.com/HQJaTu/python-mfiles.git@topic/Python3",
 ]
 
 [project.optional-dependencies]
