@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mfiles-grpc"
+version = "0.0.1"
+description = "Python client for the M-Files gRPC API"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "Jari Turkia", email = "jatu@hqcodeshop.fi" }
+]
+dependencies = [
+    "grpcio>=1.84.0",
+    "protobuf>=7.35.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "grpcio-tools>=1.84.0",
+    "pytest>=9.0.2",
+    "black>=26.3.1",
+    "flake8>=7.3.0",
+]
+
+[project.scripts]
+mfiles-grpc = "mfiles_grpc.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
