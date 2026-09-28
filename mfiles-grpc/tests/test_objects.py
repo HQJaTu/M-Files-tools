@@ -77,7 +77,8 @@ def test_create_object_carries_values_and_checks_in():
         pb.CreateNewObjectWithPropertyMetadataResponse()
     objects.create_object(client, 101, {0: values.text("Test"), 100: values.lookup(1, 2)})
     (request,), _ = client.objects.CreateNewObjectWithPropertyMetadata.call_args
-    assert request.object_type_id == 101 and request.check_in is True
+    assert request.object_type_id == 101
+    assert request.check_in is True
     got = {p.property_def: p.value for p in request.properties_with_metadata}
     assert got[0].data.text == "Test"
     assert got[100].data.lookup.value_list_item_info.obj_id.item_id.internal_id == 2
@@ -88,4 +89,5 @@ def test_destroy_object_names_one_object_all_versions():
     client = fake_client()
     objects.destroy_object(client, 101, 9999)
     (request,), _ = client.objects.DestroyObject.call_args
-    assert request.obj_id.item_id.internal_id == 9999 and request.all_versions is True
+    assert request.obj_id.item_id.internal_id == 9999
+    assert request.all_versions is True

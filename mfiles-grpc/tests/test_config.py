@@ -66,7 +66,8 @@ def test_address_and_ca_cert(tmp_path):
 
 def test_no_address_means_host_and_port(tmp_path):
     s = _settings(tmp_path, CONFIG)
-    assert s.address is None and s.ca_cert is None
+    assert s.address is None
+    assert s.ca_cert is None
     assert s.target == "example.cloudvault.m-files.com:8443"
 
 
@@ -94,7 +95,9 @@ def test_sso_needs_no_user_name_or_password(tmp_path, monkeypatch):
     s = load_settings(str(path))
     assert s.auth == "sso"
     assert s.sso_token == "access"
-    assert s.username is None and s.password is None and s.token is None
+    assert s.username is None
+    assert s.password is None
+    assert s.token is None
 
 
 def test_password_login_is_the_default(tmp_path):

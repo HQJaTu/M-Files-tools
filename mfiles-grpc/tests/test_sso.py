@@ -53,8 +53,9 @@ def test_default_oauth_plugin_wins_over_the_first():
 
 
 def test_without_an_oauth_plugin_the_error_names_what_was_found():
+    plugins = [pb.PluginInfo(name="X", assembly_name="Some.Other.Plugin")]
     with pytest.raises(sso.SsoError, match="Some.Other.Plugin"):
-        sso.oauth_config_from_plugins([pb.PluginInfo(name="X", assembly_name="Some.Other.Plugin")])
+        sso.oauth_config_from_plugins(plugins)
 
 
 def test_redirect_defaults_to_localhost_like_the_desktop_client():
@@ -184,8 +185,9 @@ def test_code_exchange_returns_the_access_token_when_configured():
 
 def test_code_exchange_without_the_wanted_token_is_an_error():
     post = mock.Mock(return_value={"access_token": "ACCESS"})
+    oauth = config()
     with pytest.raises(sso.SsoError, match="id_token"):
-        sso.exchange_code(config(), "abc", "v", "http://localhost", post=post)
+        sso.exchange_code(oauth, "abc", "v", "http://localhost", post=post)
 
 
 def test_loopback_address_takes_the_redirects_own_port():

@@ -283,15 +283,19 @@ def main() -> int:
 
     logging.basicConfig(format="%(levelname)-7s %(message)s", level=options.log_level.upper())
 
+    # Conflicts are reported outside the handler: they are expected findings, not a traceback.
+    conflicts: list[str] = []
     with Client.connect(load_settings(options.config)) as client:
         try:
             changes = build_schema(client, options)
         except SchemaConflict as exc:
-            for conflict in exc.conflicts:
-                log.error("%s", conflict)
-            log.error("Nothing was changed. Fix %s in M-Files Admin, then run this again.",
-                      "it" if len(exc.conflicts) == 1 else "them")
-            return 2
+            conflicts = exc.conflicts
+    if conflicts:
+        for conflict in conflicts:
+            log.error("%s", conflict)
+        log.error("Nothing was changed. Fix %s in M-Files Admin, then run this again.",
+                  "it" if len(conflicts) == 1 else "them")
+        return 2
 
     if not changes:
         log.info("No changes made: the vault already has the eBook schema.")
