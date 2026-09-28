@@ -4,6 +4,7 @@
 Command line checks for an M-Files gRPC connection.
 
     mfiles-grpc capabilities     anonymous; proves the host speaks gRPC
+    mfiles-grpc auth-config      anonymous; shows the vault's SSO (OAuth) settings
     mfiles-grpc login            logs in and out; proves the credentials
     mfiles-grpc check-session    logs in and makes one read that needs the session
     mfiles-grpc structure        lists object types, classes and property definitions
@@ -15,7 +16,7 @@ import sys
 
 from google.protobuf import json_format
 
-from . import structure
+from . import sso, structure
 from .client import Client, SessionNotAccepted
 from .config import load_settings
 from .proto import pb
@@ -24,16 +25,34 @@ log = logging.getLogger(__name__)
 
 
 def _capabilities(args, settings) -> int:
-    client = Client(settings.host, settings.port)
+    client = Client(settings.host, settings.port, settings.address, settings.ca_cert)
     try:
         caps = client.server_capabilities()
     finally:
         client.close()
     enabled = sorted(k for k, v in json_format.MessageToDict(
         caps, preserving_proto_field_name=True).items() if v is True)
-    print(f"{settings.host}:{settings.port} answers gRPC; {len(enabled)} capabilities enabled")
+    print(f"{settings.target} answers gRPC; {len(enabled)} capabilities enabled")
     for name in enabled:
         print(f"  {name}")
+    return 0
+
+
+def _auth_config(args, settings) -> int:
+    client = Client(settings.host, settings.port, settings.address, settings.ca_cert)
+    try:
+        config = sso.discover(client, settings.vault)
+    finally:
+        client.close()
+    for name, value in (
+            ("plugin", config.plugin_name), ("configuration scope", config.configuration_scope),
+            ("vault", config.vault_guid), ("client ID", config.client_id),
+            ("authorization endpoint", config.authorization_endpoint),
+            ("token endpoint", config.token_endpoint), ("scopes", " ".join(config.scopes)),
+            ("redirect URI", config.redirect_uri), ("resource", config.resource),
+            ("client secret", "set" if config.client_secret else "none"),
+            ("token sent", "access" if config.use_access_token else "id")):
+        print(f"{name:>22}: {value}")
     return 0
 
 
@@ -46,20 +65,13 @@ def _login(args, settings) -> int:
 
 
 def _check_session(args, settings) -> int:
-    if args.header:
-        settings.session_header = args.header
-    if args.encoding:
-        settings.session_encoding = args.encoding
-    if not settings.session_header:
-        print("No session header: set [m-files.tool.grpc] session-header or pass --header", file=sys.stderr)
-        return 2
     with Client.connect(settings) as client:
         try:
             client.check_session()
         except SessionNotAccepted as e:
             print(f"Not accepted: {e}", file=sys.stderr)
             return 1
-    print(f"Session accepted as {settings.session_header!r} ({settings.session_encoding})")
+    print("Session accepted")
     return 0
 
 
@@ -87,11 +99,9 @@ def main(argv=None) -> int:
     parser.add_argument("--log-level", default="WARNING")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("capabilities").set_defaults(run=_capabilities)
+    commands.add_parser("auth-config").set_defaults(run=_auth_config)
     commands.add_parser("login").set_defaults(run=_login)
-    check = commands.add_parser("check-session")
-    check.add_argument("--header", help="metadata key carrying the session ID")
-    check.add_argument("--encoding", choices=("hex", "base64", "raw"))
-    check.set_defaults(run=_check_session)
+    commands.add_parser("check-session").set_defaults(run=_check_session)
     commands.add_parser("structure").set_defaults(run=_structure)
 
     args = parser.parse_args(argv)

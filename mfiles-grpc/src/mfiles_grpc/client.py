@@ -3,57 +3,63 @@
 """
 Connection, login and session handling for the M-Files gRPC API.
 
-Verified against an M-Files Cloud vault (2026-09-23):
-  * gRPC is served on the REST host, port 443, at /MFiles.<Service>/<Method>.
+Verified against an M-Files Cloud vault (2026-09-23, 2026-09-24):
+  * gRPC is served on the REST host and port (443 for M-Files Cloud), at
+    /MFiles.<Service>/<Method>.
   * Anonymous calls work (GetServerCapabilities, GetPublicKeyAnonymous).
   * IRPCLogin/LogIn with AUTH_DATA_TYPE_CREDENTIALS returns a 48-byte session ID.
-
-NOT yet verified: which call metadata carries that session ID on later calls.
-The .proto does not say. It is configurable (session_header / session_encoding)
-until it is known; see the README.
+  * SSO logs in with AUTH_DATA_TYPE_PLUGIN (log_in_with_token), giving the same kind of session.
+  * Later calls are authenticated by that session ID in call metadata; see
+    call_metadata(). The .proto does not say this; the header names came from M-Files.
 """
 
-import base64
+import dataclasses
 import logging
+import uuid
 from typing import Callable, Optional
 
 import grpc
 
+from . import sso
 from .config import ConnectionSettings
 from .proto import pb, rpc
 
 log = logging.getLogger(__name__)
 
-SESSION_ENCODINGS = ("hex", "base64", "raw")
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+
+# Call metadata M-Files' own clients send. gRPC base64-encodes '-bin' values itself,
+# so these carry raw bytes.
+SESSION_HEADER = "mfiles-session-id-bin"          # LogIn's session_id, unchanged
+REMOTE_CALL_HEADER = "mfiles-is-remote-call"
+ACTIVITY_HEADER = "mfiles-activity-id-bin"        # a new GUID per call, for tracing
+
+# The named value an SSO login carries its token in, as the M-Files web client sends it.
+PLUGIN_TOKEN_KEY = "Token"
 
 
 class SessionNotAccepted(Exception):
     """The server answered UNAUTHENTICATED to a call made with our session."""
 
 
-def encode_session(session_id: bytes, header: str, encoding: str) -> str | bytes:
+def call_metadata(session_id: Optional[bytes]) -> list[tuple[str, str | bytes]]:
     """
-    Turn a session ID into a call-metadata value.
+    Metadata for one call.
 
-    :param session_id: Raw session ID from LogIn
-    :param header: Metadata key. gRPC requires a key ending in '-bin' to carry bytes.
-    :param encoding: 'hex', 'base64' or 'raw' (ignored for '-bin' keys)
-    :return: Metadata value
+    :param session_id: Session ID from LogIn, or None before logging in
+    :return: Metadata pairs; the session header only when there is a session
     """
-    if header.endswith("-bin"):
-        return session_id
-    if encoding == "hex":
-        return session_id.hex()
-    if encoding == "base64":
-        return base64.b64encode(session_id).decode("ascii")
-    if encoding == "raw":
-        return session_id.decode("ascii")
-    raise ValueError(f"Unknown session encoding {encoding!r}, expected one of {SESSION_ENCODINGS}")
+    metadata: list[tuple[str, str | bytes]] = [
+        (REMOTE_CALL_HEADER, "true"),
+        (ACTIVITY_HEADER, uuid.uuid4().bytes),
+    ]
+    if session_id is not None:
+        metadata.insert(0, (SESSION_HEADER, session_id))
+    return metadata
 
 
 class _SessionInterceptor(grpc.UnaryUnaryClientInterceptor):
-    """Adds the session metadata, when there is a session, to every unary call."""
+    """Adds the M-Files metadata, with the session when there is one, to every unary call."""
 
     def __init__(self, metadata: Callable[[], list[tuple[str, str | bytes]]]):
         self._metadata = metadata
@@ -79,22 +85,34 @@ class Client:
             ...
     """
 
-    def __init__(self, host: str, port: int = 443,
-                 session_header: Optional[str] = None, session_encoding: str = "hex"):
-        if session_encoding not in SESSION_ENCODINGS:
-            raise ValueError(f"Unknown session encoding {session_encoding!r}")
+    def __init__(self, host: str, port: int = 443, address: Optional[str] = None,
+                 ca_cert: Optional[str] = None):
+        """
+        :param host: The vault host: logged in to, and the name its certificate must carry
+        :param port: The vault's port
+        :param address: host:port to connect to instead, e.g. a capturing proxy. The
+            certificate is still checked against host, so the proxy must present one for it.
+        :param ca_cert: PEM file of root certificates to trust instead of the system's
+        """
         self.host = host
         self.port = port
-        self.session_header = session_header
-        self.session_encoding = session_encoding
+        self.target = address or f"{host}:{port}"
         self.session_id: Optional[bytes] = None
         self.session: Optional[pb.SessionData] = None
         self.vault: Optional[str] = None
 
+        options = [("grpc.max_receive_message_length", MAX_MESSAGE_BYTES),
+                   ("grpc.max_send_message_length", MAX_MESSAGE_BYTES)]
+        if address:
+            options.append(("grpc.ssl_target_name_override", host))
+            log.info("Connecting to %s through %s", host, address)
+        root_certificates = None
+        if ca_cert:
+            with open(ca_cert, "rb") as f:
+                root_certificates = f.read()
         self._raw_channel = grpc.secure_channel(
-            f"{host}:{port}", grpc.ssl_channel_credentials(),
-            options=[("grpc.max_receive_message_length", MAX_MESSAGE_BYTES),
-                     ("grpc.max_send_message_length", MAX_MESSAGE_BYTES)])
+            self.target, grpc.ssl_channel_credentials(root_certificates=root_certificates),
+            options=options)
         self.channel = grpc.intercept_channel(self._raw_channel,
                                               _SessionInterceptor(self._session_metadata))
         self._stubs: dict[str, object] = {}
@@ -105,11 +123,16 @@ class Client:
         :param settings: From config.load_settings()
         :return: A client logged in to settings.vault
         """
-        client = cls(settings.host, settings.port,
-                     session_header=settings.session_header,
-                     session_encoding=settings.session_encoding)
+        client = cls(settings.host, settings.port, settings.address, settings.ca_cert)
         try:
-            client.log_in(settings.username, settings.password, settings.vault)
+            if settings.auth == "sso":
+                config = sso.discover(client, settings.vault)
+                if settings.sso_token:
+                    config = dataclasses.replace(config, use_access_token=settings.sso_token == "access")
+                token = settings.token or sso.acquire_token(config)
+                client.log_in_with_token(token, settings.vault, config.plugin_name, config.configuration_scope)
+            else:
+                client.log_in(settings.username, settings.password, settings.vault)
         except Exception:
             client.close()
             raise
@@ -122,10 +145,7 @@ class Client:
         self.close()
 
     def _session_metadata(self) -> list[tuple[str, str | bytes]]:
-        if self.session_id is None or not self.session_header:
-            return []
-        return [(self.session_header,
-                 encode_session(self.session_id, self.session_header, self.session_encoding))]
+        return call_metadata(self.session_id)
 
     def stub(self, service: str):
         """
@@ -162,16 +182,51 @@ class Client:
         :param vault: Vault GUID, with or without braces
         :return: The session; its session_id is kept on the client
         """
+        return self._log_in(pb.AuthDataClient(
+            type=pb.AUTH_DATA_TYPE_CREDENTIALS,
+            data=pb.AuthDataClientUnion(credentials=pb.Credentials(
+                username=username, password=password, type=pb.CREDENTIALS_TYPE_MFILES))),
+            vault, client_name)
+
+    def log_in_with_token(self, token: str, vault: str, plugin_name: str, configuration_scope: str,
+                          client_name: str = "mfiles-grpc") -> pb.SessionData:
+        """
+        Log in with a token from the vault's identity provider (SSO); see sso.py.
+
+        The request is the one the M-Files web client sends: the token as the only
+        named value, "Token", with an all-zero attempt ID, in one round trip.
+
+        :param token: ID token, or access token if the plugin is configured for it
+        :param plugin_name: OAuthConfig.plugin_name
+        :param configuration_scope: OAuthConfig.configuration_scope
+        :return: The session; its session_id is kept on the client
+        """
+        # Not values.text(): it refuses more than 100 characters, and a JWT is far longer.
+        token_value = pb.TypedValue(type=pb.DATATYPE_TEXT, data=pb.TypedValueUnion(text=token))
+        return self._log_in(pb.AuthDataClient(
+            type=pb.AUTH_DATA_TYPE_PLUGIN,
+            data=pb.AuthDataClientUnion(plugin=pb.AuthDataClientUnion.PluginData(
+                authentication_attempt_identifier=pb.AuthenticationAttemptIdentifier(data=bytes(32)),
+                plugin_name=plugin_name,
+                configuration_scope=configuration_scope,
+                data_format=pb.PLUGIN_AUTH_DATA_FORMAT_UNENCRYPTED,
+                auth_data=[pb.NamedValue(key=PLUGIN_TOKEN_KEY, value=token_value)]))),
+            vault, client_name)
+
+    def _log_in(self, authentication: pb.AuthDataClient, vault: str, client_name: str) -> pb.SessionData:
         request = pb.LogInRequest(
             environment_data=pb.EnvironmentData(client_name=client_name, host_platform="Python"),
-            client_data=pb.ClientData(type=pb.CLIENT_TYPE_SERVER_API, language="en"),
+            client_data=pb.ClientData(
+                type=pb.CLIENT_TYPE_SERVER_API, language="en",
+                # The 32-byte attempt ID of a plugin login is the long form.
+                capabilities=pb.ClientCapabilities(long_authentication_attempt_identifier=True)),
             login_data=pb.LoginData(server_hostname=self.host, vault_guid=vault),
-            authentication_data=pb.AuthDataClient(
-                type=pb.AUTH_DATA_TYPE_CREDENTIALS,
-                data=pb.AuthDataClientUnion(credentials=pb.Credentials(
-                    username=username, password=password, type=pb.CREDENTIALS_TYPE_MFILES))))
+            authentication_data=authentication)
         response = self.login_service.LogIn(request)
         if not response.session_data.session_id:
+            if response.authentication_data.data.WhichOneof("data") == "plugin" \
+                    and not response.authentication_data.data.plugin.is_done:
+                raise SessionNotAccepted("LogIn wants a multi-step plugin exchange, which is not supported")
             raise SessionNotAccepted("LogIn returned no session ID")
 
         self.session = response.session_data
@@ -179,24 +234,19 @@ class Client:
         self.vault = vault
         log.info("Logged in to %s vault %s: session ID %d bytes, keep-alive every %d s",
                  self.host, vault, len(self.session_id), self.session.keep_alive_interval_in_seconds)
-        if not self.session_header:
-            log.warning("No session header configured: calls that need a session will fail "
-                        "with UNAUTHENTICATED. See README, 'How the session travels'.")
         return self.session
 
     def check_session(self) -> None:
         """
         Make one cheap read-only call that needs a session.
 
-        :raises SessionNotAccepted: The server did not accept the session metadata
+        :raises SessionNotAccepted: The server did not accept the session
         """
         try:
             self.object_types.GetObjectTypes(pb.GetObjectTypesRequest())
         except grpc.RpcError as e:
             if e.code() == grpc.StatusCode.UNAUTHENTICATED:
-                raise SessionNotAccepted(
-                    f"Server rejected the session sent as {self.session_header!r} "
-                    f"({self.session_encoding}): {e.details()}") from e
+                raise SessionNotAccepted(f"Server rejected the session: {e.details()}") from e
             raise
 
     def keep_alive(self) -> None:

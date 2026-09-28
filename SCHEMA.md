@@ -3,6 +3,10 @@
 What `ebook-uploader.py` expects a vault to contain, written so someone with M-Files Admin
 access can build the same structure in a different vault from scratch.
 
+`ebook-uploader-create-schema.py` builds it for you; see
+[Recreating this in a new vault](#recreating-this-in-a-new-vault). The rest of this document
+is what that script creates, and what to build by hand if you would rather not use it.
+
 Everything below was read out of the live vault over MFWS
 (`structure/objecttypes`, `structure/classes`, `structure/properties`, `valuelists`)
 rather than transcribed from the code, so it describes what actually exists.
@@ -73,7 +77,7 @@ properties; the other three are plain — an Author object is just a name.
 
 ## Property definitions to create by hand
 
-These five are the only ones that need making in M-Files Admin. All are plain (not based on a
+These five are the only ones that need making by hand, in M-Files Admin or by the script. All are plain (not based on a
 value list) and apply to all object types.
 
 | Name | Data type | Holds |
@@ -153,8 +157,8 @@ not survive — a known limp, not a silent one.
 * **Object listings cap at 500 rows.** `objects?o=101` returns 500 with `MoreResults: true`
   and no other complaint. Pass `&limit=100000`; the `&l=` parameter is ignored.
 * **The metadata structure is read-only over MFWS.** `POST /REST/structure/properties` answers
-  HTTP 405. Every property definition here has to be created in M-Files Admin by a person;
-  only then can a script verify it.
+  HTTP 405. The gRPC API's admin services can create them, which is what
+  `ebook-uploader-create-schema.py` uses; otherwise they are made in M-Files Admin.
 * **Windows `MAX_PATH`.** When the client's local path plus filename exceeds 260 characters
   the Windows client cannot open or download the file and throws a raw JSON error into the
   preview pane. Metadata still displays, and MFWS is unaffected, so this never breaks an
@@ -162,6 +166,45 @@ not survive — a known limp, not a silent one.
   as a server-side problem.
 
 ## Recreating this in a new vault
+
+### With the script
+
+```
+ebook-uploader-create-schema.py --dry-run     # what is missing; changes nothing
+ebook-uploader-create-schema.py               # create it
+```
+
+It reads the same `client-config.toml` as `ebook-uploader.py`, connects over the M-Files gRPC
+API (the `mfiles-grpc` package in this repository) and needs a user with vault administrator
+rights. The name options (`--object-type`, `--object-class`, `--author-type`,
+`--publisher-type`, `--bundle-type`) match the uploader's, for a vault that uses other names.
+
+What it does:
+
+* Looks up every object type, class and property above **by name** and creates only what is
+  missing: the four object types (only `eBook` can hold files), the five property definitions,
+  one class per object type, and the eBook class's associations, none of them required.
+  Associations already on the class are kept as they are.
+* New object types and properties copy their permissions from the built-in Document type
+  and from `Keywords` (26), so they get the vault's usual access control.
+* **Re-entrant.** On a vault that already has the schema it changes nothing and says
+  `No changes made: the vault already has the eBook schema.` Run it again after a partial
+  setup and it fills in only the gaps.
+* **Checks everything before writing anything.** Something that exists by a right name but
+  with the wrong shape (a value list where an object type should be, a property with another
+  data type, a class on another object type) is a conflict. The script lists every conflict,
+  writes nothing and exits with code 2. Conflicts are left for a person to fix in M-Files
+  Admin. The only change the script makes to anything that already exists is adding missing
+  properties to a class; it never renames, retypes or deletes a definition.
+
+Then do step 5 below: run the uploader on a handful of books and read its startup log.
+
+Offline tests are in `tests/test_ebook_uploader_create_schema.py` (`pytest` from the
+repository root). Against a live vault it has so far only been run on this one, where the
+schema was already complete: the creating calls are tested offline only. Use `--dry-run`
+first on a new vault.
+
+### By hand in M-Files Admin
 
 1. Create object types `eBook`, `Author`, `Publisher`, `eBook bundle`. Let M-Files generate
    each one's value list and lookup properties.

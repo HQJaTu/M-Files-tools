@@ -74,7 +74,8 @@ def _lookup(value_list: int, item_id: int) -> pb.Lookup:
     return pb.Lookup(
         value_list_item_info=pb.ItemInfo(
             obj_id=pb.ObjID(type=value_list, item_id=pb.ItemID(internal_id=item_id))),
-        version=pb.ObjVerVersion(type=pb.OBJ_VER_VERSION_TYPE_LATEST))
+        # As the server itself encodes a lookup to "the latest version".
+        version=pb.ObjVerVersion(type=pb.OBJ_VER_VERSION_TYPE_LATEST, internal_version=-1))
 
 
 def lookup(value_list: int, item_id: int) -> pb.TypedValue:

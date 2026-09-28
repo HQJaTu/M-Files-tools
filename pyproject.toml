@@ -36,4 +36,7 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["connection-test", "ebook-uploader"]
+py-modules = ["connection-test", "ebook-uploader", "ebook-uploader-create-schema"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
