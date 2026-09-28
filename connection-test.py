@@ -173,7 +173,6 @@ def ping(server_address: str, user: str, password: str, vault: str) -> None:
     }
     """
 
-    # object_types = my_client.objects()
     object_type = "eBook"
     ebook_info = my_client.get_info(object_type, category=mfiles.MFilesClient.CategoryType.OBJECT_TYPE)
     log.info(ebook_info)
