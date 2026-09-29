@@ -7,7 +7,7 @@ name = "mfiles-tools"
 version = "0.0.1"
 description = "Collection of M-Files tools"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
   { name = "Jari Turkia", email = "jatu@hqcodeshop.fi" }
 ]
@@ -26,6 +26,8 @@ dependencies = [
     "tika==3.1.0",
     #mfiles==0.5.3",
     "mfiles @ git+https://github.com/HQJaTu/python-mfiles.git@topic/Python3",
+    # gRPC client, used by ebook-uploader-create-schema.py
+    "mfiles-grpc>=1.0.0",
 ]
 
 [project.optional-dependencies]
