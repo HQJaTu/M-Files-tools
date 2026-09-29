@@ -175,8 +175,9 @@ ebook-uploader-create-schema.py               # create it
 ```
 
 It reads the same `client-config.toml` as `ebook-uploader.py`, connects over the M-Files gRPC
-API (the `mfiles-grpc` package in this repository) and needs a user with vault administrator
-rights. The name options (`--object-type`, `--object-class`, `--author-type`,
+API (the [`mfiles-grpc`](https://pypi.org/project/mfiles-grpc/) package, developed at
+[M-Files/mfiles-grpc-python](https://github.com/M-Files/mfiles-grpc-python)) and needs a user
+with vault administrator rights. The name options (`--object-type`, `--object-class`, `--author-type`,
 `--publisher-type`, `--bundle-type`) match the uploader's, for a vault that uses other names.
 
 What it does:
